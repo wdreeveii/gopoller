@@ -6,6 +6,7 @@ import (
 	"github.com/alouca/gosnmp"
 	"github.com/coopernurse/gorp"
 	_ "github.com/go-sql-driver/mysql"
+	"log"
 	"os"
 	"os/signal"
 	"runtime/pprof"
@@ -45,6 +46,13 @@ type SnmpPollerConfig struct {
 	History                        string `db:"history"`
 }
 
+type SnmpFetchResult struct {
+	Config  SnmpPollerConfig
+	Retries int
+	Data    []gosnmp.SnmpPDU
+	Err     error
+}
+
 func SnmpBulkWalk(s *gosnmp.GoSNMP, root_oid string, prefix string) (results []gosnmp.SnmpPDU, err error) {
 	var resp *gosnmp.SnmpPacket
 	resp, err = s.GetBulk(0, 20, root_oid)
@@ -53,10 +61,13 @@ func SnmpBulkWalk(s *gosnmp.GoSNMP, root_oid string, prefix string) (results []g
 	}
 
 	for i, v := range resp.Variables {
+		// is this variable still in the requested oid range
 		if strings.HasPrefix(v.Name, prefix) {
 			results = append(results, v)
+			// is the last oid recieved still in the requested range
 			if i == len(resp.Variables)-1 {
 				var sub_results []gosnmp.SnmpPDU
+				// call again until no more data needs to be pulled
 				sub_results, err = SnmpBulkWalk(s, v.Name, prefix)
 				if err != nil {
 					return
@@ -68,7 +79,19 @@ func SnmpBulkWalk(s *gosnmp.GoSNMP, root_oid string, prefix string) (results []g
 	return
 }
 
-func fetchOidFromConfig(cfg SnmpPollerConfig, done chan []gosnmp.SnmpPDU) {
+func updatePollTimes(result SnmpFetchResult) (res SnmpFetchResult) {
+	res = result
+	res.Config.LastPollTime = Now()
+	res.Config.NextPollTime = res.Config.LastPollTime + 1000*int64(res.Config.PollFreq)
+	return
+}
+
+// do one snmp query
+func fetchOidFromConfig(cfg SnmpPollerConfig, retries int, done chan SnmpFetchResult) {
+	var result = SnmpFetchResult{Config: cfg, Retries: retries}
+	/*defer func() {
+		done <- result
+	}()*/
 	//time.Sleep(time.Duration(idx * 100000000))
 	var snmpver gosnmp.SnmpVersion
 	if cfg.SnmpVersion == "SNMP2c" {
@@ -77,110 +100,162 @@ func fetchOidFromConfig(cfg SnmpPollerConfig, done chan []gosnmp.SnmpPDU) {
 		snmpver = gosnmp.Version1
 	}
 	//cfg.SnmpTimeout = 60
-	s, err := gosnmp.NewGoSNMP(cfg.IpAddress, cfg.SnmpCommunityName, snmpver, 2*cfg.SnmpTimeout)
-	if err != nil {
-		fmt.Println(err)
-		done <- []gosnmp.SnmpPDU{}
+	var SnmpConn *gosnmp.GoSNMP
+	SnmpConn, result.Err = gosnmp.NewGoSNMP(cfg.IpAddress, cfg.SnmpCommunityName, snmpver, cfg.SnmpTimeout)
+	if result.Err != nil {
+		done <- result
 		return
 	}
-	//s.SetDebug(true)
-	//s.SetVerbose(true)
-	s.SetTimeout(cfg.SnmpTimeout)
-	var results []gosnmp.SnmpPDU
+	//SnmpConn.SetDebug(true)
+	//SnmpConn.SetVerbose(true)
+	SnmpConn.SetTimeout(cfg.SnmpTimeout)
+	var data []gosnmp.SnmpPDU
 	if cfg.PollType == "Walk" {
-		res, err := SnmpBulkWalk(s, "."+cfg.Oid, "."+cfg.Oid)
-		if err != nil {
-			fmt.Println(err)
-			done <- []gosnmp.SnmpPDU{}
+		var res []gosnmp.SnmpPDU
+		res, result.Err = SnmpBulkWalk(SnmpConn, "."+cfg.Oid, "."+cfg.Oid)
+		if result.Err != nil {
+			done <- result
 			return
 		}
-		results = append(results, res...)
+		data = append(data, res...)
 	} else if cfg.PollType == "Get" {
-		resp, err := s.Get(cfg.Oid)
-		if err != nil {
-			fmt.Println(err)
-			done <- []gosnmp.SnmpPDU{}
+		var resp *gosnmp.SnmpPacket
+		resp, result.Err = SnmpConn.Get(cfg.Oid)
+		if result.Err != nil {
+			done <- result
 			return
 		}
-		results = append(results, resp.Variables...)
+		data = append(data, resp.Variables...)
 	}
-	done <- results
+	result = updatePollTimes(result)
+	result.Data = data
+	done <- result
 }
+
+// return current time in milliseconds
 func Now() (now int64) {
 	return time.Now().UnixNano() / int64(time.Millisecond)
 }
+func Delay(one_config SnmpPollerConfig, run chan SnmpPollerConfig) {
+	// calculate milliseconds between now and when this oid should get polled
+	deltams := one_config.NextPollTime - Now()
+	fmt.Println("Waiting:", deltams)
+	// wait until this oid should get polled
+	<-time.After(time.Duration(deltams) * time.Millisecond)
+	select {
+	case run <- one_config: // dispatch oid to run
+	default: // if the notification channel has been disabled, do nothing
+	}
+}
 func pollConfig(cfg Config) {
-	fmt.Println(cfg)
-
+	var out = log.New(os.Stdout, "", log.Ldate|log.Ltime)
+	out.Println(cfg)
 	var dsn string
+	// build connection string
 	dsn = cfg.Config.Username + ":" + cfg.Config.Password + "@tcp(" + cfg.Config.Host + ":" + strconv.Itoa(int(cfg.Config.Port)) + ")/" + cfg.Config.Database + "?allowOldPasswords=1"
-	fmt.Println(dsn)
+	out.Println(dsn)
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		fmt.Println(err)
+		out.Println(err)
 		return
 	}
+	// close db before this function returns
 	defer db.Close()
 
+	// test connection to make sure it works
 	err = db.Ping()
 	if err != nil {
-		fmt.Println(err)
+		out.Println(err)
 		return
 	}
-	fmt.Println("pinged", Now())
+	out.Println("pinged", Now())
+	// setup sql to data structure mapping
 	dbmap := &gorp.DbMap{Db: db, Dialect: gorp.MySQLDialect{}}
 	dbmap.AddTableWithName(SnmpPollerConfig{}, "snmpPollerConfig")
+	// pull oids from the database
 	var configs []SnmpPollerConfig
 	_, err = dbmap.Select(&configs, "SELECT * FROM snmpPollingConfig WHERE "+cfg.Config.Filter[0])
 	if err != nil {
-		fmt.Println(err)
+		out.Println(err)
 		return
 	}
+	// waiting_oids is used to notify the main loop when oids are ready to pull
 	var waiting_oids chan SnmpPollerConfig
-	results := make(chan []gosnmp.SnmpPDU)
+	// results of the snmp query
+	result := make(chan SnmpFetchResult)
+	// number of active snmp queries
 	var num_fetching int
 	for _, c := range configs {
 		if Now() >= c.NextPollTime {
+			// this oid needs to be pulled
 			num_fetching++
-			fmt.Println(Now(), "fetching:", num_fetching, c)
-			go fetchOidFromConfig(c, results)
+			out.Println(Now(), "fetching:", num_fetching, c)
+			go fetchOidFromConfig(c, 0, result)
 		} else {
+			// this oid is not ready to be pulled
 			if waiting_oids == nil {
 				waiting_oids = make(chan SnmpPollerConfig, len(configs))
 			}
-			go func(one_config SnmpPollerConfig, run chan SnmpPollerConfig) {
-				deltams := one_config.NextPollTime - Now()
-				fmt.Println("Waiting:", deltams)
-				<-time.After(time.Duration(deltams) * time.Millisecond)
-				select {
-				case run <- one_config:
-				default:
-				}
-			}(c, waiting_oids)
+			// create a go routine that is paused until the oid is ready
+			// when the time has passed it will notify the main loop and
+			// the oid will get processed
+			go Delay(c, waiting_oids)
 		}
 	}
-	fmt.Println("Config Manager Setup")
+	out.Println("Config Manager Setup")
+	var num_errors int
+	var num_total_timeout int
 	var stopConfirmation chan bool
 MAINLOOP:
 	for {
 		if num_fetching == 0 && waiting_oids == nil {
+			// there are no active queries and
+			// waiting_oids has been disabled because
+			// there was a request to clean up
 			break MAINLOOP
 		}
 		select {
 		case stopConfirmation = <-cfg.stopChan:
-			fmt.Println("cleaning up...")
+			// recieved a request to clean up
+			out.Println("cleaning up...")
+			// disable notifications for waiting oids
 			waiting_oids = nil
 		case cfg := <-waiting_oids:
+			// recieved a paused oid that needs to be processed
 			num_fetching++
-			fmt.Println(Now(), "fetching:", num_fetching, cfg)
-			go fetchOidFromConfig(cfg, results)
-		case oid_data := <-results:
+			out.Println(Now(), "fetching:", num_fetching, cfg)
+			go fetchOidFromConfig(cfg, 0, result)
+		case oid_data := <-result:
+			// recieved the results of a snmp query
 			num_fetching--
-			fmt.Println("Recieved:", num_fetching, ":", oid_data)
-			//store data
+			if oid_data.Err != nil {
+				// there was an error with this fetch so keep a count
+				num_errors++
+				out.Println(oid_data.Err)
+				if oid_data.Retries < oid_data.Config.SnmpRetries {
+					// begin a new request if the oid has not
+					// been fetched too many times
+					num_fetching++
+					go fetchOidFromConfig(oid_data.Config, oid_data.Retries+1, result)
+				} else {
+					// this oid has been tried too many times this cycle,
+					// requeue for the next cycle
+					num_total_timeout++
+					oid_data = updatePollTimes(oid_data)
+					go Delay(oid_data.Config, waiting_oids)
+				}
+			} else {
+				// requeue the fetched oid
+				if waiting_oids != nil {
+					go Delay(oid_data.Config, waiting_oids)
+				}
+				out.Println("Recieved:", num_fetching, ":", oid_data)
+				//store data
+			}
+			out.Println(num_errors, "Errors", num_total_timeout, "Total Timeouts")
 		}
 	}
-	fmt.Println("Config Manage All Done.")
+	out.Println("Config Manage All Done.")
 	stopConfirmation <- true
 }
 
@@ -191,33 +266,44 @@ func main() {
 			fmt.Println(err)
 		}
 	}()
+	// parse args and get path
 	path, err := parseArgsAndFindPath()
 	if err != nil {
 		return
 	}
+	// noop if profiling is not enabled
 	defer pprof.StopCPUProfile()
 
 	fmt.Println("Using Config:", path)
+	// SIGHUP is the standard way to reinitialize configuration on command
 	signal_source := make(chan os.Signal)
 	signal.Notify(signal_source, syscall.SIGHUP)
 	for {
+		// read all configs at the specified path
+		// if path is a directory, read all files ending in .gcfg
+		// otherwise read path
 		cfgs, err := GetConfigs(path)
 		if err != nil {
 			return
 		}
 		fmt.Println(len(cfgs), "valid configs.")
+		// create channels to notify config managers when they need to stop and clean up
 		for i, _ := range cfgs {
 			cfgs[i].stopChan = make(chan chan bool)
 			go pollConfig(cfgs[i])
 		}
-		restart := time.After(2 * time.Minute)
+		// periodically restart the system so config is reinitialized from file
+		restart := time.After(10 * time.Minute)
 		select {
 		case sig := <-signal_source:
+			// recieved a SIGHUP
 			fmt.Println("Recieved signal:", sig)
 		case <-restart:
+			// initiating periodic restart
 			fmt.Println("Restarting")
 		}
-
+		// a channel is sent to each config manager so that it can in turn
+		// notify us when they are finished cleaning up
 		var stop_replies []chan bool
 		for _, v := range cfgs {
 			reply_chan := make(chan bool)
@@ -225,6 +311,7 @@ func main() {
 			v.stopChan <- reply_chan
 		}
 		fmt.Println("Waiting for threads to end.")
+		// wait for all managers to exit
 		for _, v := range stop_replies {
 			<-v
 		}

@@ -11,7 +11,10 @@ import (
 
 type Config struct {
 	stopChan chan chan bool
-	Config   struct {
+	Logging  struct {
+		Main string
+	}
+	Config struct {
 		Host     string
 		Port     uint
 		Database string
