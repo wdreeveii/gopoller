@@ -229,9 +229,9 @@ func pollConfig(cfg Config) {
 		return
 	}
 	// waiting_oids is used to notify the main loop when oids are ready to pull
-	var waiting_oids chan SnmpPollingConfig
+	var waiting_oids = make(chan SnmpPollingConfig, len(configs))
 	// results of the snmp query
-	result := make(chan SnmpFetchResult)
+	var result = make(chan SnmpFetchResult)
 	// number of active snmp queries
 	var num_fetching int
 	for _, c := range configs {
@@ -242,9 +242,6 @@ func pollConfig(cfg Config) {
 			go fetchOidFromConfig(c, 0, result)
 		} else {
 			// this oid is not ready to be pulled
-			if waiting_oids == nil {
-				waiting_oids = make(chan SnmpPollingConfig, len(configs))
-			}
 			// create a go routine that is paused until the oid is ready
 			// when the time has passed it will notify the main loop and
 			// the oid will get processed
@@ -294,20 +291,20 @@ MAINLOOP:
 					oid_data = updatePollTimes(oid_data)
 					go Delay(oid_data.Config, waiting_oids)
 					// update poll times in snmpPollingConfig
-					/*err = updateDbPollTimes(oid_data.Config, dbmap)
+					err = updateDbPollTimes(oid_data.Config, dbmap)
 					if err != nil {
 						fmt.Println(err)
-					}*/
+					}
 				}
 			} else {
 				// requeue the fetched oid
 				if waiting_oids != nil {
 					go Delay(oid_data.Config, waiting_oids)
 				}
-				/*err = updateDbPollTimes(oid_data.Config, dbmap)
+				err = updateDbPollTimes(oid_data.Config, dbmap)
 				if err != nil {
 					fmt.Println(err)
-				}*/
+				}
 				out.Println("Recieved:", num_fetching, ":", len(oid_data.Data), "variables. Requested:", oid_data.Config.Oid)
 				//store data
 				err = storeSnmpResults(oid_data, warehouse_db)
