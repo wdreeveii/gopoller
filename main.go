@@ -16,12 +16,12 @@ import (
 	"time"
 )
 
-// Represents nmsConfigurationRemote.SnmpPollerConfig table
+// Represents nmsConfigurationRemote.SnmpPollingConfig table
 // Go requires all public members of structs to be capitalized.
 // The "Tag String" at the end of each field is used by the
 // SQL Mapping logic to map members of this struct to specific
 // columns.
-type SnmpPollerConfig struct {
+type SnmpPollingConfig struct {
 	ResourceName                   string `db:"resourceName"`
 	Description                    string `db:"description"`
 	IpAddress                      string `db:"ipAddress"`
@@ -47,7 +47,7 @@ type SnmpPollerConfig struct {
 }
 
 type SnmpFetchResult struct {
-	Config  SnmpPollerConfig
+	Config  SnmpPollingConfig
 	Retries int
 	Data    []gosnmp.SnmpPDU
 	Err     error
@@ -86,8 +86,47 @@ func updatePollTimes(result SnmpFetchResult) (res SnmpFetchResult) {
 	return
 }
 
+func updateDbPollTimes(c SnmpPollingConfig, dbmap *gorp.DbMap) (err error) {
+	var q = "" +
+		"UPDATE `nmsConfigurationRemote`.`test_snmpPollingConfig`\n" +
+		"SET `lastPollTime` = ?, `nextPollTime` = ?\n" +
+		"WHERE resourceName = ? AND oid = ?"
+	_, err = dbmap.Exec(q, c.LastPollTime, c.NextPollTime, c.ResourceName, c.Oid)
+	return err
+}
+
+func stringifyType(t gosnmp.Asn1BER) string {
+	if t == gosnmp.Counter32 {
+		return "COUNTER"
+	} else if t == gosnmp.Gauge32 {
+		return "GAUGE"
+	} else {
+		return strings.ToUpper(t.String())
+	}
+}
+
+func storeSnmpResults(res SnmpFetchResult, db *sql.DB) error {
+	var q = "" +
+		"INSERT INTO test_raw_data_" + time.Now().Format("02") +
+		" (`dtMetric`, `host`, `oid`, `typeOid`, `value`) VALUES "
+	for i, v := range res.Data {
+		if i != 0 {
+			q += ", "
+		}
+		q += "(" +
+			fmt.Sprint(res.Config.LastPollTime/1000) + "," +
+			"'" + res.Config.IpAddress + "'," +
+			"'" + v.Name[1:] + "'," +
+			"'" + stringifyType(v.Type) + "'," +
+			"'" + fmt.Sprint(v.Value) + "' " +
+			")"
+	}
+	_, err := db.Exec(q)
+	return err
+}
+
 // do one snmp query
-func fetchOidFromConfig(cfg SnmpPollerConfig, retries int, done chan SnmpFetchResult) {
+func fetchOidFromConfig(cfg SnmpPollingConfig, retries int, done chan SnmpFetchResult) {
 	var result = SnmpFetchResult{Config: cfg, Retries: retries}
 	/*defer func() {
 		done <- result
@@ -136,7 +175,9 @@ func fetchOidFromConfig(cfg SnmpPollerConfig, retries int, done chan SnmpFetchRe
 func Now() (now int64) {
 	return time.Now().UnixNano() / int64(time.Millisecond)
 }
-func Delay(one_config SnmpPollerConfig, run chan SnmpPollerConfig) {
+
+// pause until oid is ready to be polled
+func Delay(one_config SnmpPollingConfig, run chan SnmpPollingConfig) {
 	// calculate milliseconds between now and when this oid should get polled
 	deltams := one_config.NextPollTime - Now()
 	fmt.Println("Waiting:", deltams)
@@ -148,39 +189,47 @@ func Delay(one_config SnmpPollerConfig, run chan SnmpPollerConfig) {
 	}
 }
 func pollConfig(cfg Config) {
-	var out = log.New(os.Stdout, "", log.Ldate|log.Ltime)
-	out.Println(cfg)
-	var dsn string
+	var out = log.New(os.Stdout, ".", log.Ldate|log.Ltime)
+	var err error
+	defer func() {
+		if err != nil {
+			out.Println(err)
+		}
+	}()
+	var config_dsn string
 	// build connection string
-	dsn = cfg.Config.Username + ":" + cfg.Config.Password + "@tcp(" + cfg.Config.Host + ":" + strconv.Itoa(int(cfg.Config.Port)) + ")/" + cfg.Config.Database + "?allowOldPasswords=1"
-	out.Println(dsn)
-	db, err := sql.Open("mysql", dsn)
+	config_dsn = cfg.Config.Username + ":" + cfg.Config.Password + "@tcp(" + cfg.Config.Host + ":" + strconv.Itoa(int(cfg.Config.Port)) + ")/" + cfg.Config.Database + "?allowOldPasswords=1"
+	config_db, err := sql.Open("mysql", config_dsn)
 	if err != nil {
-		out.Println(err)
 		return
 	}
 	// close db before this function returns
-	defer db.Close()
+	defer config_db.Close()
 
 	// test connection to make sure it works
-	err = db.Ping()
+	err = config_db.Ping()
 	if err != nil {
-		out.Println(err)
 		return
 	}
-	out.Println("pinged", Now())
-	// setup sql to data structure mapping
-	dbmap := &gorp.DbMap{Db: db, Dialect: gorp.MySQLDialect{}}
-	dbmap.AddTableWithName(SnmpPollerConfig{}, "snmpPollerConfig")
-	// pull oids from the database
-	var configs []SnmpPollerConfig
-	_, err = dbmap.Select(&configs, "SELECT * FROM snmpPollingConfig WHERE "+cfg.Config.Filter[0])
+	var warehouse_dsn string
+	warehouse_dsn = cfg.Warehouse.Username + ":" + cfg.Warehouse.Password + "@tcp(" + cfg.Warehouse.Host + ":" + strconv.Itoa(int(cfg.Warehouse.Port)) + ")/" + cfg.Warehouse.Database + "?allowOldPasswords=1"
+	warehouse_db, err := sql.Open("mysql", warehouse_dsn)
 	if err != nil {
-		out.Println(err)
+		return
+	}
+	defer warehouse_db.Close()
+
+	// setup sql to data structure mapping
+	dbmap := &gorp.DbMap{Db: config_db, Dialect: gorp.MySQLDialect{}}
+	dbmap.AddTableWithName(SnmpPollingConfig{}, "snmpPollingConfig")
+	// pull oids from the database
+	var configs []SnmpPollingConfig
+	_, err = dbmap.Select(&configs, "SELECT * FROM test_snmpPollingConfig WHERE "+cfg.Config.Filter[0])
+	if err != nil {
 		return
 	}
 	// waiting_oids is used to notify the main loop when oids are ready to pull
-	var waiting_oids chan SnmpPollerConfig
+	var waiting_oids chan SnmpPollingConfig
 	// results of the snmp query
 	result := make(chan SnmpFetchResult)
 	// number of active snmp queries
@@ -194,7 +243,7 @@ func pollConfig(cfg Config) {
 		} else {
 			// this oid is not ready to be pulled
 			if waiting_oids == nil {
-				waiting_oids = make(chan SnmpPollerConfig, len(configs))
+				waiting_oids = make(chan SnmpPollingConfig, len(configs))
 			}
 			// create a go routine that is paused until the oid is ready
 			// when the time has passed it will notify the main loop and
@@ -212,6 +261,7 @@ MAINLOOP:
 			// there are no active queries and
 			// waiting_oids has been disabled because
 			// there was a request to clean up
+			out.Println("breaking...", waiting_oids)
 			break MAINLOOP
 		}
 		select {
@@ -243,14 +293,27 @@ MAINLOOP:
 					num_total_timeout++
 					oid_data = updatePollTimes(oid_data)
 					go Delay(oid_data.Config, waiting_oids)
+					// update poll times in snmpPollingConfig
+					/*err = updateDbPollTimes(oid_data.Config, dbmap)
+					if err != nil {
+						fmt.Println(err)
+					}*/
 				}
 			} else {
 				// requeue the fetched oid
 				if waiting_oids != nil {
 					go Delay(oid_data.Config, waiting_oids)
 				}
-				out.Println("Recieved:", num_fetching, ":", oid_data)
+				/*err = updateDbPollTimes(oid_data.Config, dbmap)
+				if err != nil {
+					fmt.Println(err)
+				}*/
+				out.Println("Recieved:", num_fetching, ":", len(oid_data.Data), "variables. Requested:", oid_data.Config.Oid)
 				//store data
+				err = storeSnmpResults(oid_data, warehouse_db)
+				if err != nil {
+					out.Println(err)
+				}
 			}
 			out.Println(num_errors, "Errors", num_total_timeout, "Total Timeouts")
 		}
