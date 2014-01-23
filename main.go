@@ -180,7 +180,6 @@ func Now() (now int64) {
 func Delay(one_config SnmpPollingConfig, run chan SnmpPollingConfig) {
 	// calculate milliseconds between now and when this oid should get polled
 	deltams := one_config.NextPollTime - Now()
-	fmt.Println("Waiting:", deltams)
 	// wait until this oid should get polled
 	<-time.After(time.Duration(deltams) * time.Millisecond)
 	select {
@@ -189,7 +188,7 @@ func Delay(one_config SnmpPollingConfig, run chan SnmpPollingConfig) {
 	}
 }
 func pollConfig(cfg Config) {
-	var out = log.New(os.Stdout, ".", log.Ldate|log.Ltime)
+	var out = log.New(os.Stdout, " ", log.Ldate|log.Ltime)
 	var err error
 	defer func() {
 		if err != nil {
@@ -219,6 +218,9 @@ func pollConfig(cfg Config) {
 	}
 	defer warehouse_db.Close()
 
+	rate_limiter := time.NewTicker(100 * time.Millisecond)
+	defer rate_limiter.Stop()
+
 	// setup sql to data structure mapping
 	dbmap := &gorp.DbMap{Db: config_db, Dialect: gorp.MySQLDialect{}}
 	dbmap.AddTableWithName(SnmpPollingConfig{}, "snmpPollingConfig")
@@ -237,6 +239,7 @@ func pollConfig(cfg Config) {
 	for _, c := range configs {
 		if Now() >= c.NextPollTime {
 			// this oid needs to be pulled
+			<-rate_limiter.C
 			num_fetching++
 			out.Println(Now(), "fetching:", num_fetching, c)
 			go fetchOidFromConfig(c, 0, result)
@@ -258,19 +261,19 @@ MAINLOOP:
 			// there are no active queries and
 			// waiting_oids has been disabled because
 			// there was a request to clean up
-			out.Println("breaking...", waiting_oids)
 			break MAINLOOP
 		}
 		select {
 		case stopConfirmation = <-cfg.stopChan:
 			// recieved a request to clean up
-			out.Println("cleaning up...")
+			out.Println("Config Manager restart requested: cleaning up...")
 			// disable notifications for waiting oids
 			waiting_oids = nil
 		case cfg := <-waiting_oids:
 			// recieved a paused oid that needs to be processed
+			<-rate_limiter.C
 			num_fetching++
-			out.Println(Now(), "fetching:", num_fetching, cfg)
+			out.Println("fetching:", num_fetching, cfg.ResourceName, cfg.IpAddress, cfg.Oid, cfg.PollType, cfg.PollFreq)
 			go fetchOidFromConfig(cfg, 0, result)
 		case oid_data := <-result:
 			// recieved the results of a snmp query
@@ -282,6 +285,7 @@ MAINLOOP:
 				if oid_data.Retries < oid_data.Config.SnmpRetries {
 					// begin a new request if the oid has not
 					// been fetched too many times
+					<-rate_limiter.C
 					num_fetching++
 					go fetchOidFromConfig(oid_data.Config, oid_data.Retries+1, result)
 				} else {
