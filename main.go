@@ -79,13 +79,27 @@ func SnmpBulkWalk(s *gosnmp.GoSNMP, root_oid string, prefix string) (results []g
 	return
 }
 
+// update poll time fields in the snmpPollingConfig structure
 func updatePollTimes(result SnmpFetchResult) (res SnmpFetchResult) {
 	res = result
+	// this time math is used to generate a poll time 1/4 of the way through the next timeslot
+	current := time.Now()
+	year, month, day := current.Date()
+	today := time.Date(year, month, day, 0, 0, 0, 0, time.Local)
+	freq := time.Duration(res.Config.PollFreq) * time.Second
+
+	pollOffset := freq / 4
+
+	current_daily_timeslot := current.Sub(today) / freq
+	next_timeslot_start := today.Add((current_daily_timeslot + 1) * freq)
+	next_poll_start := next_timeslot_start.Add(pollOffset)
+
 	res.Config.LastPollTime = Now()
-	res.Config.NextPollTime = res.Config.LastPollTime + 1000*int64(res.Config.PollFreq)
+	res.Config.NextPollTime = next_poll_start.UnixNano() / int64(time.Millisecond)
 	return
 }
 
+// update poll time fields in nmsConfigurationRemote.snmpPollingConfig table
 func updateDbPollTimes(c SnmpPollingConfig, dbmap *gorp.DbMap) (err error) {
 	var q = "" +
 		"UPDATE `nmsConfigurationRemote`.`test_snmpPollingConfig`\n" +
@@ -95,6 +109,8 @@ func updateDbPollTimes(c SnmpPollingConfig, dbmap *gorp.DbMap) (err error) {
 	return err
 }
 
+// convert snmp value types into a string representation and
+// fixups differences in naming between gosnmp's and the original
 func stringifyType(t gosnmp.Asn1BER) string {
 	if t == gosnmp.Counter32 {
 		return "COUNTER"
@@ -105,6 +121,10 @@ func stringifyType(t gosnmp.Asn1BER) string {
 	}
 }
 
+// generate a bulk insert statement to insert the values
+// into the database and run it
+// the mysql driver package does not yet support bulk insert
+// with prepared statements.
 func storeSnmpResults(res SnmpFetchResult, db *sql.DB) error {
 	var q = "" +
 		"INSERT INTO test_raw_data_" + time.Now().Format("02") +
@@ -187,6 +207,8 @@ func Delay(one_config SnmpPollingConfig, run chan SnmpPollingConfig) {
 	default: // if the notification channel has been disabled, do nothing
 	}
 }
+
+// main polling function for 1 configuration file
 func pollConfig(cfg Config) {
 	var out = log.New(os.Stdout, " ", log.Ldate|log.Ltime)
 	var err error
@@ -197,7 +219,9 @@ func pollConfig(cfg Config) {
 	}()
 	var config_dsn string
 	// build connection string
-	config_dsn = cfg.Config.Username + ":" + cfg.Config.Password + "@tcp(" + cfg.Config.Host + ":" + strconv.Itoa(int(cfg.Config.Port)) + ")/" + cfg.Config.Database + "?allowOldPasswords=1"
+	config_dsn = cfg.Config.Username + ":" + cfg.Config.Password +
+		"@tcp(" + cfg.Config.Host + ":" + strconv.Itoa(int(cfg.Config.Port)) + ")/" +
+		cfg.Config.Database + "?allowOldPasswords=1"
 	config_db, err := sql.Open("mysql", config_dsn)
 	if err != nil {
 		return
@@ -211,13 +235,22 @@ func pollConfig(cfg Config) {
 		return
 	}
 	var warehouse_dsn string
-	warehouse_dsn = cfg.Warehouse.Username + ":" + cfg.Warehouse.Password + "@tcp(" + cfg.Warehouse.Host + ":" + strconv.Itoa(int(cfg.Warehouse.Port)) + ")/" + cfg.Warehouse.Database + "?allowOldPasswords=1"
+	warehouse_dsn = cfg.Warehouse.Username + ":" + cfg.Warehouse.Password +
+		"@tcp(" + cfg.Warehouse.Host + ":" + strconv.Itoa(int(cfg.Warehouse.Port)) + ")/" +
+		cfg.Warehouse.Database + "?allowOldPasswords=1"
 	warehouse_db, err := sql.Open("mysql", warehouse_dsn)
 	if err != nil {
 		return
 	}
 	defer warehouse_db.Close()
 
+	err = warehouse_db.Ping()
+	if err != nil {
+		return
+	}
+
+	// NewTicker returns a new Ticker containing a channel that will send 
+	// the time with a period specified by the duration argument.
 	rate_limiter := time.NewTicker(100 * time.Millisecond)
 	defer rate_limiter.Stop()
 
@@ -239,9 +272,10 @@ func pollConfig(cfg Config) {
 	for _, c := range configs {
 		if Now() >= c.NextPollTime {
 			// this oid needs to be pulled
+			// wait until the ticker channel emits a value
 			<-rate_limiter.C
 			num_fetching++
-			out.Println(Now(), "fetching:", num_fetching, c)
+			out.Println("fetching:", num_fetching, c)
 			go fetchOidFromConfig(c, 0, result)
 		} else {
 			// this oid is not ready to be pulled
@@ -287,6 +321,7 @@ MAINLOOP:
 					// been fetched too many times
 					<-rate_limiter.C
 					num_fetching++
+					out.Println("fetching:", num_fetching, oid_data.Config.ResourceName, oid_data.Config.IpAddress, oid_data.Config.Oid, oid_data.Config.PollType, oid_data.Config.PollFreq)
 					go fetchOidFromConfig(oid_data.Config, oid_data.Retries+1, result)
 				} else {
 					// this oid has been tried too many times this cycle,
