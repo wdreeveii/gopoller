@@ -41,17 +41,29 @@ type Config struct {
 func validateConfig(cfg Config) (result Config, err error) {
 	result = cfg
 	if len(cfg.Config.Host) == 0 {
-		err = errors.New("No host provided.")
+		err = errors.New("Config: No host provided.")
 	} else if cfg.Config.Port == 0 {
-		err = errors.New("No port provided.")
+		err = errors.New("Config: No port provided.")
 	} else if len(cfg.Config.Database) == 0 {
-		err = errors.New("No database provided.")
+		err = errors.New("Config: No database provided.")
 	} else if len(cfg.Config.Username) == 0 {
-		err = errors.New("No username provided.")
+		err = errors.New("Config: No username provided.")
 	} else if len(cfg.Config.Password) == 0 {
-		err = errors.New("No password provided.")
+		err = errors.New("Config: No password provided.")
 	} else if len(cfg.Config.Filter) == 0 {
-		err = errors.New("No filter provided.")
+		err = errors.New("Config: No filter provided.")
+	}
+
+	if len(cfg.Warehouse.Host) == 0 {
+		err = errors.New("Warehouse: No host provided.")
+	} else if cfg.Warehouse.Port == 0 {
+		err = errors.New("Warehouse: No port provided.")
+	} else if len(cfg.Warehouse.Database) == 0 {
+		err = errors.New("Warehouse: No database provided.")
+	} else if len(cfg.Warehouse.Username) == 0 {
+		err = errors.New("Warehouse: No username provided.")
+	} else if len(cfg.Warehouse.Password) == 0 {
+		err = errors.New("Warehouse: No password provided.")
 	}
 	return
 }
