@@ -319,16 +319,20 @@ MAINLOOP:
 				if oid_data.Retries < oid_data.Config.SnmpRetries {
 					// begin a new request if the oid has not
 					// been fetched too many times
-					<-rate_limiter.C
-					num_fetching++
-					out.Println("fetching:", num_fetching, oid_data.Config.ResourceName, oid_data.Config.IpAddress, oid_data.Config.Oid, oid_data.Config.PollType, oid_data.Config.PollFreq)
-					go fetchOidFromConfig(oid_data.Config, oid_data.Retries+1, result)
+					if waiting_oids != nil {
+						<-rate_limiter.C
+						num_fetching++
+						out.Println("fetching:", num_fetching, oid_data.Config.ResourceName, oid_data.Config.IpAddress, oid_data.Config.Oid, oid_data.Config.PollType, oid_data.Config.PollFreq)
+						go fetchOidFromConfig(oid_data.Config, oid_data.Retries+1, result)
+					}
 				} else {
 					// this oid has been tried too many times this cycle,
 					// requeue for the next cycle
 					num_total_timeout++
 					oid_data = updatePollTimes(oid_data)
-					go Delay(oid_data.Config, waiting_oids)
+					if waiting_oids != nil {
+						go Delay(oid_data.Config, waiting_oids)
+					}
 					// update poll times in snmpPollingConfig
 					err = updateDbPollTimes(oid_data.Config, dbmap)
 					if err != nil {
