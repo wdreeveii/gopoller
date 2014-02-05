@@ -145,6 +145,15 @@ func storeSnmpResults(res SnmpFetchResult, db *sql.DB) error {
 	return err
 }
 
+func setAlarms(resourceName string, severity int, db *sql.DB) error {
+	var q = `
+	INSERT INTO evenge.foreign (dtEvent, resourceName, subresourceName, severity, eventText) VALUES (
+		NOW(), '` + resourceName + `', 'SNMP Timeout', ` + strconv.Itoa(severity) + `, 'SNMP Agent IS NOT responding'
+		)`
+	_, err := db.Exec(q)
+	return err
+}
+
 // do one snmp query
 func fetchOidFromConfig(cfg SnmpPollingConfig, retries int, done chan SnmpFetchResult) {
 	var result = SnmpFetchResult{Config: cfg, Retries: retries}
@@ -183,7 +192,7 @@ func fetchOidFromConfig(cfg SnmpPollingConfig, retries int, done chan SnmpFetchR
 		if result.Err != nil {
 			done <- result
 			return
-		}
+		} 
 		data = append(data, resp.Variables...)
 	}
 	result = updatePollTimes(result)
@@ -208,46 +217,76 @@ func Delay(one_config SnmpPollingConfig, run chan SnmpPollingConfig) {
 	}
 }
 
+func Debugln(l *log.Logger, cfg Config, v ...interface{}) {
+	if cfg.Logging.Level == "debug" {
+		l.Println(v)
+	}
+}
+
+func openAndPingDb(dsn string) (db *sql.DB, err error) {
+	db, err = sql.Open("mysql", dsn)
+	if err != nil {
+		return
+	}
+	// test connection to make sure it works
+	err = db.Ping()
+	if err != nil {
+		db.Close()
+		return
+	}
+	return
+}
+
 // main polling function for 1 configuration file
 func pollConfig(cfg Config) {
-	var out = log.New(os.Stdout, " ", log.Ldate|log.Ltime)
 	var err error
+	
+	logfile, err := os.OpenFile(cfg.Logging.Main, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0660)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer logfile.Close()
+	
+	var out = log.New(logfile, " ", log.Ldate|log.Ltime)
+	
 	defer func() {
 		if err != nil {
 			out.Println(err)
 		}
 	}()
+
 	var config_dsn string
 	// build connection string
 	config_dsn = cfg.Config.Username + ":" + cfg.Config.Password +
 		"@tcp(" + cfg.Config.Host + ":" + strconv.Itoa(int(cfg.Config.Port)) + ")/" +
 		cfg.Config.Database + "?allowOldPasswords=1"
-	config_db, err := sql.Open("mysql", config_dsn)
+	config_db, err := openAndPingDb(config_dsn)
 	if err != nil {
 		return
 	}
 	// close db before this function returns
 	defer config_db.Close()
 
-	// test connection to make sure it works
-	err = config_db.Ping()
-	if err != nil {
-		return
-	}
 	var warehouse_dsn string
 	warehouse_dsn = cfg.Warehouse.Username + ":" + cfg.Warehouse.Password +
 		"@tcp(" + cfg.Warehouse.Host + ":" + strconv.Itoa(int(cfg.Warehouse.Port)) + ")/" +
 		cfg.Warehouse.Database + "?allowOldPasswords=1"
-	warehouse_db, err := sql.Open("mysql", warehouse_dsn)
+	warehouse_db, err := openAndPingDb(warehouse_dsn)
 	if err != nil {
 		return
 	}
 	defer warehouse_db.Close()
 
-	err = warehouse_db.Ping()
+	var alarms_dsn string
+	alarms_dsn = cfg.Alarms.Username + ":" + cfg.Alarms.Password +
+		"@tcp(" + cfg.Alarms.Host + ":" + strconv.Itoa(int(cfg.Alarms.Port)) + ")/" +
+		cfg.Alarms.Database + "?allowOldPasswords=1"
+	alarms_db, err := openAndPingDb(alarms_dsn)
 	if err != nil {
 		return
 	}
+	defer alarms_db.Close()
 
 	// NewTicker returns a new Ticker containing a channel that will send 
 	// the time with a period specified by the duration argument.
@@ -275,7 +314,7 @@ func pollConfig(cfg Config) {
 			// wait until the ticker channel emits a value
 			<-rate_limiter.C
 			num_fetching++
-			out.Println("fetching:", num_fetching, c)
+			Debugln(out, cfg, "fetching:", num_fetching, c)
 			go fetchOidFromConfig(c, 0, result)
 		} else {
 			// this oid is not ready to be pulled
@@ -285,7 +324,7 @@ func pollConfig(cfg Config) {
 			go Delay(c, waiting_oids)
 		}
 	}
-	out.Println("Config Manager Setup")
+	Debugln(out, cfg, "Config Manager Setup")
 	var num_errors int
 	var num_total_timeout int
 	var stopConfirmation chan bool
@@ -300,15 +339,15 @@ MAINLOOP:
 		select {
 		case stopConfirmation = <-cfg.stopChan:
 			// recieved a request to clean up
-			out.Println("Config Manager restart requested: cleaning up...")
+			Debugln(out, cfg, "Config Manager restart requested: cleaning up...")
 			// disable notifications for waiting oids
 			waiting_oids = nil
-		case cfg := <-waiting_oids:
+		case snmp_cfg := <-waiting_oids:
 			// recieved a paused oid that needs to be processed
 			<-rate_limiter.C
 			num_fetching++
-			out.Println("fetching:", num_fetching, cfg.ResourceName, cfg.IpAddress, cfg.Oid, cfg.PollType, cfg.PollFreq)
-			go fetchOidFromConfig(cfg, 0, result)
+			Debugln(out, cfg, "fetching:", num_fetching, snmp_cfg.ResourceName, snmp_cfg.IpAddress, snmp_cfg.Oid, snmp_cfg.PollType, snmp_cfg.PollFreq)
+			go fetchOidFromConfig(snmp_cfg, 0, result)
 		case oid_data := <-result:
 			// recieved the results of a snmp query
 			num_fetching--
@@ -322,7 +361,7 @@ MAINLOOP:
 					if waiting_oids != nil {
 						<-rate_limiter.C
 						num_fetching++
-						out.Println("fetching:", num_fetching, oid_data.Config.ResourceName, oid_data.Config.IpAddress, oid_data.Config.Oid, oid_data.Config.PollType, oid_data.Config.PollFreq)
+						Debugln(out, cfg, "fetching:", num_fetching, oid_data.Config.ResourceName, oid_data.Config.IpAddress, oid_data.Config.Oid, oid_data.Config.PollType, oid_data.Config.PollFreq)
 						go fetchOidFromConfig(oid_data.Config, oid_data.Retries+1, result)
 					}
 				} else {
@@ -336,7 +375,11 @@ MAINLOOP:
 					// update poll times in snmpPollingConfig
 					err = updateDbPollTimes(oid_data.Config, dbmap)
 					if err != nil {
-						fmt.Println(err)
+						out.Println(err)
+					}
+					err = setAlarms(oid_data.Config.ResourceName, 5, alarms_db)
+					if err != nil {
+						out.Println(err)
 					}
 				}
 			} else {
@@ -350,14 +393,18 @@ MAINLOOP:
 				}
 				err = updateDbPollTimes(oid_data.Config, dbmap)
 				if err != nil {
-					fmt.Println(err)
+					out.Println(err)
 				}
-				out.Println("Recieved:", num_fetching, ":", len(oid_data.Data), "variables. Requested:", oid_data.Config.Oid)
+				err = setAlarms(oid_data.Config.ResourceName, 0, alarms_db)
+				if err != nil {
+					out.Println(err)
+				}
+				Debugln(out, cfg, "Recieved:", num_fetching, ":", len(oid_data.Data), "variables. Requested:", oid_data.Config.Oid)
 			}
-			out.Println(num_errors, "Errors", num_total_timeout, "Total Timeouts")
+			Debugln(out, cfg, num_errors, "Errors", num_total_timeout, "Total Timeouts")
 		}
 	}
-	out.Println("Config Manage All Done.")
+	Debugln(out, cfg, "Config Manage All Done.")
 	stopConfirmation <- true
 }
 
