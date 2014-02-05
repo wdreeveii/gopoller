@@ -110,7 +110,7 @@ func updateDbPollTimes(c SnmpPollingConfig, dbmap *gorp.DbMap) (err error) {
 }
 
 // convert snmp value types into a string representation and
-// fixups differences in naming between gosnmp's and the original
+// fixup differences in naming between gosnmp's and the original
 func stringifyType(t gosnmp.Asn1BER) string {
 	if t == gosnmp.Counter32 {
 		return "COUNTER"
@@ -340,16 +340,15 @@ MAINLOOP:
 				if waiting_oids != nil {
 					go Delay(oid_data.Config, waiting_oids)
 				}
+				err = storeSnmpResults(oid_data, warehouse_db)
+				if err != nil {
+					out.Println(err)
+				}
 				err = updateDbPollTimes(oid_data.Config, dbmap)
 				if err != nil {
 					fmt.Println(err)
 				}
 				out.Println("Recieved:", num_fetching, ":", len(oid_data.Data), "variables. Requested:", oid_data.Config.Oid)
-				//store data
-				err = storeSnmpResults(oid_data, warehouse_db)
-				if err != nil {
-					out.Println(err)
-				}
 			}
 			out.Println(num_errors, "Errors", num_total_timeout, "Total Timeouts")
 		}
