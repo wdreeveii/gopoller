@@ -102,7 +102,7 @@ func updatePollTimes(result SnmpFetchResult) (res SnmpFetchResult) {
 // update poll time fields in nmsConfigurationRemote.snmpPollingConfig table
 func updateDbPollTimes(c SnmpPollingConfig, dbmap *gorp.DbMap) (err error) {
 	var q = "" +
-		"UPDATE `nmsConfigurationRemote`.`test_snmpPollingConfig`\n" +
+		"UPDATE `nmsConfigurationRemote`.`snmpPollingConfig`\n" +
 		"SET `lastPollTime` = ?, `nextPollTime` = ?\n" +
 		"WHERE resourceName = ? AND oid = ?"
 	_, err = dbmap.Exec(q, c.LastPollTime, c.NextPollTime, c.ResourceName, c.Oid)
@@ -127,7 +127,7 @@ func stringifyType(t gosnmp.Asn1BER) string {
 // with prepared statements.
 func storeSnmpResults(res SnmpFetchResult, db *sql.DB) error {
 	var q = "" +
-		"INSERT INTO test_raw_data_" + time.Now().Format("02") +
+		"INSERT INTO raw_data_" + time.Now().Format("02") +
 		" (`dtMetric`, `host`, `oid`, `typeOid`, `value`) VALUES "
 	for i, v := range res.Data {
 		if i != 0 {
@@ -259,7 +259,7 @@ func pollConfig(cfg Config) {
 	dbmap.AddTableWithName(SnmpPollingConfig{}, "snmpPollingConfig")
 	// pull oids from the database
 	var configs []SnmpPollingConfig
-	_, err = dbmap.Select(&configs, "SELECT * FROM test_snmpPollingConfig WHERE "+cfg.Config.Filter[0])
+	_, err = dbmap.Select(&configs, "SELECT * FROM snmpPollingConfig WHERE "+cfg.Config.Filter[0])
 	if err != nil {
 		return
 	}
