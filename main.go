@@ -7,6 +7,7 @@ import (
 	"github.com/coopernurse/gorp"
 	_ "github.com/go-sql-driver/mysql"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
 	"runtime/pprof"
@@ -53,32 +54,6 @@ type SnmpFetchResult struct {
 	Err     error
 }
 
-func SnmpBulkWalk(s *gosnmp.GoSNMP, root_oid string, prefix string) (results []gosnmp.SnmpPDU, err error) {
-	var resp *gosnmp.SnmpPacket
-	resp, err = s.GetBulk(0, 20, root_oid)
-	if err != nil {
-		return
-	}
-
-	for i, v := range resp.Variables {
-		// is this variable still in the requested oid range
-		if strings.HasPrefix(v.Name, prefix) {
-			results = append(results, v)
-			// is the last oid recieved still in the requested range
-			if i == len(resp.Variables)-1 {
-				var sub_results []gosnmp.SnmpPDU
-				// call again until no more data needs to be pulled
-				sub_results, err = SnmpBulkWalk(s, v.Name, prefix)
-				if err != nil {
-					return
-				}
-				results = append(results, sub_results...)
-			}
-		}
-	}
-	return
-}
-
 // update poll time fields in the snmpPollingConfig structure
 func updatePollTimes(result SnmpFetchResult) (res SnmpFetchResult) {
 	res = result
@@ -92,7 +67,7 @@ func updatePollTimes(result SnmpFetchResult) (res SnmpFetchResult) {
 
 	current_daily_timeslot := current.Sub(today) / freq
 	next_timeslot_start := today.Add((current_daily_timeslot + 1) * freq)
-	next_poll_start := next_timeslot_start.Add(pollOffset)
+	next_poll_start := next_timeslot_start.Add(pollOffset + time.Duration(rand.Int63n(int64(pollOffset))))
 
 	res.Config.LastPollTime = Now()
 	res.Config.NextPollTime = next_poll_start.UnixNano() / int64(time.Millisecond)
@@ -125,24 +100,39 @@ func stringifyType(t gosnmp.Asn1BER) string {
 // into the database and run it
 // the mysql driver package does not yet support bulk insert
 // with prepared statements.
-func storeSnmpResults(res SnmpFetchResult, db *sql.DB) error {
-	var q = "" +
-		"INSERT INTO raw_data_" + time.Now().Format("02") +
-		" (`dtMetric`, `host`, `oid`, `typeOid`, `value`) VALUES "
-	for i, v := range res.Data {
-		if i != 0 {
-			q += ", "
+func storeSnmpResults(res SnmpFetchResult, warehouse_db *sql.DB, realtime_db *sql.DB) (err error) {
+	if warehouse_db != nil || realtime_db != nil {
+		var data string
+
+		for i, v := range res.Data {
+			if i != 0 {
+				data += ", "
+			}
+			data += "(" +
+				fmt.Sprint(res.Config.LastPollTime/1000) + "," +
+				"'" + res.Config.IpAddress + "'," +
+				"'" + v.Name[1:] + "'," +
+				"'" + stringifyType(v.Type) + "'," +
+				"'" + fmt.Sprint(v.Value) + "' " +
+				")"
 		}
-		q += "(" +
-			fmt.Sprint(res.Config.LastPollTime/1000) + "," +
-			"'" + res.Config.IpAddress + "'," +
-			"'" + v.Name[1:] + "'," +
-			"'" + stringifyType(v.Type) + "'," +
-			"'" + fmt.Sprint(v.Value) + "' " +
-			")"
+
+		if warehouse_db != nil && res.Config.History == "Yes" {
+			var q = "" +
+				"INSERT INTO raw_data_" + time.Now().Format("02") +
+				" (`dtMetric`, `host`, `oid`, `typeOid`, `value`) VALUES "
+			q += data
+			_, err = warehouse_db.Exec(q)
+		}
+
+		if realtime_db != nil && res.Config.RealTimeReporting == "Yes" {
+			var q = "" +
+				"INSERT INTO rawData (`tsMetric`, `hostIpAddress`, `oid`, `typeOid`, `value`) VALUES "
+			q += data
+			_, err = realtime_db.Exec(q)
+		}
 	}
-	_, err := db.Exec(q)
-	return err
+	return
 }
 
 func setAlarms(resourceName string, severity int, db *sql.DB) error {
@@ -157,14 +147,12 @@ func setAlarms(resourceName string, severity int, db *sql.DB) error {
 // do one snmp query
 func fetchOidFromConfig(cfg SnmpPollingConfig, retries int, done chan SnmpFetchResult) {
 	var result = SnmpFetchResult{Config: cfg, Retries: retries}
-	/*defer func() {
-		done <- result
-	}()*/
+
 	//time.Sleep(time.Duration(idx * 100000000))
 	var snmpver gosnmp.SnmpVersion
 	if cfg.SnmpVersion == "SNMP2c" {
 		snmpver = gosnmp.Version2c
-	} else {
+	} else if cfg.SnmpVersion == "SNMP1" {
 		snmpver = gosnmp.Version1
 	}
 	//cfg.SnmpTimeout = 60
@@ -180,7 +168,7 @@ func fetchOidFromConfig(cfg SnmpPollingConfig, retries int, done chan SnmpFetchR
 	var data []gosnmp.SnmpPDU
 	if cfg.PollType == "Walk" {
 		var res []gosnmp.SnmpPDU
-		res, result.Err = SnmpBulkWalk(SnmpConn, "."+cfg.Oid, "."+cfg.Oid)
+		res, result.Err = SnmpConn.BulkWalk(20, "."+cfg.Oid)
 		if result.Err != nil {
 			done <- result
 			return
@@ -192,7 +180,7 @@ func fetchOidFromConfig(cfg SnmpPollingConfig, retries int, done chan SnmpFetchR
 		if result.Err != nil {
 			done <- result
 			return
-		} 
+		}
 		data = append(data, resp.Variables...)
 	}
 	result = updatePollTimes(result)
@@ -240,16 +228,16 @@ func openAndPingDb(dsn string) (db *sql.DB, err error) {
 // main polling function for 1 configuration file
 func pollConfig(cfg Config) {
 	var err error
-	
+
 	logfile, err := os.OpenFile(cfg.Logging.Main, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0660)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 	defer logfile.Close()
-	
+
 	var out = log.New(logfile, " ", log.Ldate|log.Ltime)
-	
+
 	defer func() {
 		if err != nil {
 			out.Println(err)
@@ -268,15 +256,31 @@ func pollConfig(cfg Config) {
 	// close db before this function returns
 	defer config_db.Close()
 
-	var warehouse_dsn string
-	warehouse_dsn = cfg.Warehouse.Username + ":" + cfg.Warehouse.Password +
-		"@tcp(" + cfg.Warehouse.Host + ":" + strconv.Itoa(int(cfg.Warehouse.Port)) + ")/" +
-		cfg.Warehouse.Database + "?allowOldPasswords=1"
-	warehouse_db, err := openAndPingDb(warehouse_dsn)
-	if err != nil {
-		return
+	var warehouse_db *sql.DB
+	if cfg.WarehouseProvided() {
+		var warehouse_dsn string
+		warehouse_dsn = cfg.Warehouse.Username + ":" + cfg.Warehouse.Password +
+			"@tcp(" + cfg.Warehouse.Host + ":" + strconv.Itoa(int(cfg.Warehouse.Port)) + ")/" +
+			cfg.Warehouse.Database + "?allowOldPasswords=1"
+		warehouse_db, err = openAndPingDb(warehouse_dsn)
+		if err != nil {
+			return
+		}
 	}
 	defer warehouse_db.Close()
+
+	var realtime_db *sql.DB
+	if cfg.RealtimeProvided() {
+		var realtime_dsn string
+		realtime_dsn = cfg.Realtime.Username + ":" + cfg.Realtime.Password +
+			"@tcp(" + cfg.Realtime.Host + ":" + strconv.Itoa(int(cfg.Realtime.Port)) + ")/" +
+			cfg.Realtime.Database + "?allowOldPasswords=1"
+		realtime_db, err = openAndPingDb(realtime_dsn)
+		if err != nil {
+			return
+		}
+	}
+	defer realtime_db.Close()
 
 	var alarms_dsn string
 	alarms_dsn = cfg.Alarms.Username + ":" + cfg.Alarms.Password +
@@ -288,7 +292,7 @@ func pollConfig(cfg Config) {
 	}
 	defer alarms_db.Close()
 
-	// NewTicker returns a new Ticker containing a channel that will send 
+	// NewTicker returns a new Ticker containing a channel that will send
 	// the time with a period specified by the duration argument.
 	rate_limiter := time.NewTicker(100 * time.Millisecond)
 	defer rate_limiter.Stop()
@@ -383,11 +387,12 @@ MAINLOOP:
 					}
 				}
 			} else {
+				Debugln(out, cfg, "Begin receive")
 				// requeue the fetched oid
 				if waiting_oids != nil {
 					go Delay(oid_data.Config, waiting_oids)
 				}
-				err = storeSnmpResults(oid_data, warehouse_db)
+				err = storeSnmpResults(oid_data, warehouse_db, realtime_db)
 				if err != nil {
 					out.Println(err)
 				}
@@ -399,7 +404,7 @@ MAINLOOP:
 				if err != nil {
 					out.Println(err)
 				}
-				Debugln(out, cfg, "Recieved:", num_fetching, ":", len(oid_data.Data), "variables. Requested:", oid_data.Config.Oid)
+				Debugln(out, cfg, "Received:", num_fetching, ":", len(oid_data.Data), "variables. Requested:", oid_data.Config.Oid)
 			}
 			Debugln(out, cfg, num_errors, "Errors", num_total_timeout, "Total Timeouts")
 		}
@@ -409,12 +414,16 @@ MAINLOOP:
 }
 
 func main() {
+	rand.Seed(Now())
 	var err error
+	var out = log.New(os.Stdout, " ", log.Ldate|log.Ltime)
+
 	defer func() {
 		if err != nil {
-			fmt.Println(err)
+			out.Println(err)
 		}
 	}()
+
 	// parse args and get path
 	path, err := parseArgsAndFindPath()
 	if err != nil {
@@ -423,7 +432,7 @@ func main() {
 	// noop if profiling is not enabled
 	defer pprof.StopCPUProfile()
 
-	fmt.Println("Using Config:", path)
+	out.Println("Using Config:", path)
 	// SIGHUP is the standard way to reinitialize configuration on command
 	signal_source := make(chan os.Signal)
 	signal.Notify(signal_source, syscall.SIGHUP)
@@ -435,7 +444,7 @@ func main() {
 		if err != nil {
 			return
 		}
-		fmt.Println(len(cfgs), "valid configs.")
+		out.Println(len(cfgs), "valid configs.")
 		// create channels to notify config managers when they need to stop and clean up
 		for i, _ := range cfgs {
 			cfgs[i].stopChan = make(chan chan bool)
@@ -446,10 +455,10 @@ func main() {
 		select {
 		case sig := <-signal_source:
 			// recieved a SIGHUP
-			fmt.Println("Recieved signal:", sig)
+			out.Println("Recieved signal:", sig)
 		case <-restart:
 			// initiating periodic restart
-			fmt.Println("Restarting")
+			out.Println("Restarting")
 		}
 		// a channel is sent to each config manager so that it can in turn
 		// notify us when they are finished cleaning up
@@ -459,11 +468,11 @@ func main() {
 			stop_replies = append(stop_replies, reply_chan)
 			v.stopChan <- reply_chan
 		}
-		fmt.Println("Waiting for threads to end.")
+		out.Println("Waiting for threads to end.")
 		// wait for all managers to exit
 		for _, v := range stop_replies {
 			<-v
 		}
-		fmt.Println("All cleaned up.")
+		out.Println("All cleaned up.")
 	}
 }

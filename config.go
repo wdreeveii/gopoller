@@ -12,7 +12,7 @@ import (
 type Config struct {
 	stopChan chan chan bool
 	Logging  struct {
-		Main string
+		Main  string
 		Level string
 	}
 	Config struct {
@@ -24,6 +24,13 @@ type Config struct {
 		Filter   []string
 	}
 	Warehouse struct {
+		Host     string
+		Port     uint
+		Database string
+		Username string
+		Password string
+	}
+	Realtime struct {
 		Host     string
 		Port     uint
 		Database string
@@ -46,8 +53,15 @@ type Config struct {
 	}
 }
 
+func (s *Config) WarehouseProvided() bool {
+	return len(s.Warehouse.Host) != 0
+}
+func (s *Config) RealtimeProvided() bool {
+	return len(s.Realtime.Host) != 0
+}
+
 func Keys(x map[string]bool) (res []string) {
-	for k,_ := range x {
+	for k, _ := range x {
 		res = append(res, k)
 	}
 	return
@@ -55,9 +69,9 @@ func Keys(x map[string]bool) (res []string) {
 
 func validateConfig(cfg Config) (result Config, err error) {
 	result = cfg
-	valid_loglevels := map[string]bool {
+	valid_loglevels := map[string]bool{
 		"standard": true,
-		"debug": true,
+		"debug":    true,
 	}
 
 	if len(cfg.Logging.Main) == 0 {
@@ -82,16 +96,28 @@ func validateConfig(cfg Config) (result Config, err error) {
 		err = errors.New("Config: No filter provided.")
 	}
 
-	if len(cfg.Warehouse.Host) == 0 {
-		err = errors.New("Warehouse: No host provided.")
-	} else if cfg.Warehouse.Port == 0 {
-		err = errors.New("Warehouse: No port provided.")
-	} else if len(cfg.Warehouse.Database) == 0 {
-		err = errors.New("Warehouse: No database provided.")
-	} else if len(cfg.Warehouse.Username) == 0 {
-		err = errors.New("Warehouse: No username provided.")
-	} else if len(cfg.Warehouse.Password) == 0 {
-		err = errors.New("Warehouse: No password provided.")
+	if cfg.WarehouseProvided() {
+		if cfg.Warehouse.Port == 0 {
+			err = errors.New("Warehouse: No port provided.")
+		} else if len(cfg.Warehouse.Database) == 0 {
+			err = errors.New("Warehouse: No database provided.")
+		} else if len(cfg.Warehouse.Username) == 0 {
+			err = errors.New("Warehouse: No username provided.")
+		} else if len(cfg.Warehouse.Password) == 0 {
+			err = errors.New("Warehouse: No password provided.")
+		}
+	}
+
+	if cfg.RealtimeProvided() {
+		if cfg.Realtime.Port == 0 {
+			err = errors.New("Realtime: No port provided.")
+		} else if len(cfg.Realtime.Database) == 0 {
+			err = errors.New("Realtime: No database provided.")
+		} else if len(cfg.Realtime.Username) == 0 {
+			err = errors.New("Realtime: No username provided.")
+		} else if len(cfg.Realtime.Password) == 0 {
+			err = errors.New("Realtime: No password provided.")
+		}
 	}
 
 	if len(cfg.Alarms.Host) == 0 {
