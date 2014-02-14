@@ -228,10 +228,12 @@ func openAndPingDb(dsn string) (db *sql.DB, err error) {
 // main polling function for 1 configuration file
 func pollConfig(cfg Config) {
 	var err error
-
+	var stopConfirmation chan bool
 	logfile, err := os.OpenFile(cfg.Logging.Main, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0660)
 	if err != nil {
 		fmt.Println(err)
+		stopConfirmation = <-cfg.stopChan
+		stopConfirmation <- true
 		return
 	}
 	defer logfile.Close()
@@ -251,6 +253,8 @@ func pollConfig(cfg Config) {
 		cfg.Config.Database + "?allowOldPasswords=1"
 	config_db, err := openAndPingDb(config_dsn)
 	if err != nil {
+		stopConfirmation = <-cfg.stopChan
+		stopConfirmation <- true
 		return
 	}
 	// close db before this function returns
@@ -264,6 +268,8 @@ func pollConfig(cfg Config) {
 			cfg.Warehouse.Database + "?allowOldPasswords=1"
 		warehouse_db, err = openAndPingDb(warehouse_dsn)
 		if err != nil {
+			stopConfirmation = <-cfg.stopChan
+			stopConfirmation <- true
 			return
 		}
 	}
@@ -277,6 +283,8 @@ func pollConfig(cfg Config) {
 			cfg.Realtime.Database + "?allowOldPasswords=1"
 		realtime_db, err = openAndPingDb(realtime_dsn)
 		if err != nil {
+			stopConfirmation = <-cfg.stopChan
+			stopConfirmation <- true
 			return
 		}
 	}
@@ -288,6 +296,8 @@ func pollConfig(cfg Config) {
 		cfg.Alarms.Database + "?allowOldPasswords=1"
 	alarms_db, err := openAndPingDb(alarms_dsn)
 	if err != nil {
+		stopConfirmation = <-cfg.stopChan
+		stopConfirmation <- true
 		return
 	}
 	defer alarms_db.Close()
@@ -304,6 +314,8 @@ func pollConfig(cfg Config) {
 	var configs []SnmpPollingConfig
 	_, err = dbmap.Select(&configs, "SELECT * FROM snmpPollingConfig WHERE "+cfg.Config.Filter[0])
 	if err != nil {
+		stopConfirmation = <-cfg.stopChan
+		stopConfirmation <- true
 		return
 	}
 	// waiting_oids is used to notify the main loop when oids are ready to pull
@@ -331,7 +343,7 @@ func pollConfig(cfg Config) {
 	Debugln(out, cfg, "Config Manager Setup")
 	var num_errors int
 	var num_total_timeout int
-	var stopConfirmation chan bool
+
 MAINLOOP:
 	for {
 		if num_fetching == 0 && waiting_oids == nil {
