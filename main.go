@@ -406,15 +406,15 @@ MAINLOOP:
 				}
 				err = storeSnmpResults(oid_data, warehouse_db, realtime_db)
 				if err != nil {
-					out.Println(err)
+					out.Println("Problem Storing Results:", err)
 				}
 				err = updateDbPollTimes(oid_data.Config, dbmap)
 				if err != nil {
-					out.Println(err)
+					out.Println("Problem Updating Poll Times:", err)
 				}
 				err = setAlarms(oid_data.Config.ResourceName, 0, alarms_db)
 				if err != nil {
-					out.Println(err)
+					out.Println("Problem Setting Alarms:", err)
 				}
 				Debugln(out, cfg, "Received:", num_fetching, ":", len(oid_data.Data), "variables. Requested:", oid_data.Config.Oid)
 			}
