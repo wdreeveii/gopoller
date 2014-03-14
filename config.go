@@ -70,8 +70,8 @@ func Keys(x map[string]bool) (res []string) {
 func validateConfig(cfg Config) (result Config, err error) {
 	result = cfg
 	valid_loglevels := map[string]bool{
-		"standard": true,
-		"debug":    true,
+		"none":  true,
+		"debug": true,
 	}
 
 	if len(cfg.Logging.Main) == 0 {
