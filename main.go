@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"github.com/alouca/gosnmp"
 	"github.com/coopernurse/gorp"
@@ -101,6 +102,9 @@ func stringifyType(t gosnmp.Asn1BER) string {
 // the mysql driver package does not yet support bulk insert
 // with prepared statements.
 func storeSnmpResults(res SnmpFetchResult, warehouse_db *sql.DB, realtime_db *sql.DB) (err error) {
+	if len(res.Data) == 0 {
+		return errors.New("No data to store.")
+	}
 	if warehouse_db != nil || realtime_db != nil {
 		var data string
 
@@ -273,7 +277,11 @@ func pollConfig(cfg Config) {
 			return
 		}
 	}
-	defer warehouse_db.Close()
+	defer func() {
+		if warehouse_db != nil {
+			warehouse_db.Close()
+		}
+	}()
 
 	var realtime_db *sql.DB
 	if cfg.RealtimeProvided() {
@@ -288,7 +296,11 @@ func pollConfig(cfg Config) {
 			return
 		}
 	}
-	defer realtime_db.Close()
+	defer func() {
+		if realtime_db != nil {
+			realtime_db.Close()
+		}
+	}()
 
 	var alarms_dsn string
 	alarms_dsn = cfg.Alarms.Username + ":" + cfg.Alarms.Password +
