@@ -2,7 +2,6 @@ package main
 
 import (
 	"database/sql"
-	"errors"
 	"fmt"
 	"github.com/alouca/gosnmp"
 	"github.com/coopernurse/gorp"
@@ -98,45 +97,40 @@ func stringifyType(t gosnmp.Asn1BER) string {
 }
 
 // generate a bulk insert statement to insert the values
-// into the database and run it
-// the mysql driver package does not yet support bulk insert
-// with prepared statements.
-func storeSnmpResults(res SnmpFetchResult, warehouse_db *sql.DB, realtime_db *sql.DB) (err error) {
-	if len(res.Data) == 0 {
-		return errors.New("No data to store.")
+// into the database
+func generateInsertData(res SnmpFetchResult) *string {
+	var data string
+
+	for i, v := range res.Data {
+		if i != 0 {
+			data += ", "
+		}
+		data += "(" +
+			fmt.Sprint(res.Config.LastPollTime/1000) + "," +
+			"'" + res.Config.IpAddress + "'," +
+			"'" + v.Name[1:] + "'," +
+			"'" + stringifyType(v.Type) + "'," +
+			"'" + fmt.Sprint(v.Value) + "' " +
+			")"
 	}
-	if warehouse_db != nil || realtime_db != nil {
-		var data string
+	return &data
+}
 
-		for i, v := range res.Data {
-			if i != 0 {
-				data += ", "
-			}
-			data += "(" +
-				fmt.Sprint(res.Config.LastPollTime/1000) + "," +
-				"'" + res.Config.IpAddress + "'," +
-				"'" + v.Name[1:] + "'," +
-				"'" + stringifyType(v.Type) + "'," +
-				"'" + fmt.Sprint(v.Value) + "' " +
-				")"
-		}
+func storeInWarehouseDb(data *string, warehouse_db *sql.DB) (err error) {
+	var q = "" +
+		"INSERT INTO raw_data_" + time.Now().Format("02") +
+		" (`dtMetric`, `host`, `oid`, `typeOid`, `value`) VALUES "
+	q += *data
+	_, err = warehouse_db.Exec(q)
+	return err
+}
 
-		if warehouse_db != nil && res.Config.History == "Yes" {
-			var q = "" +
-				"INSERT INTO raw_data_" + time.Now().Format("02") +
-				" (`dtMetric`, `host`, `oid`, `typeOid`, `value`) VALUES "
-			q += data
-			_, err = warehouse_db.Exec(q)
-		}
-
-		if realtime_db != nil && res.Config.RealTimeReporting == "Yes" {
-			var q = "" +
-				"INSERT INTO rawData (`tsMetric`, `hostIpAddress`, `oid`, `typeOid`, `value`) VALUES "
-			q += data
-			_, err = realtime_db.Exec(q)
-		}
-	}
-	return
+func storeInRealtimeDB(data *string, realtime_db *sql.DB) (err error) {
+	var q = "" +
+		"INSERT INTO rawData (`tsMetric`, `hostIpAddress`, `oid`, `typeOid`, `value`) VALUES "
+	q += *data
+	_, err = realtime_db.Exec(q)
+	return err
 }
 
 func setAlarms(resourceName string, severity int, db *sql.DB) error {
@@ -416,9 +410,24 @@ MAINLOOP:
 				if waiting_oids != nil {
 					go Delay(oid_data.Config, waiting_oids)
 				}
-				err = storeSnmpResults(oid_data, warehouse_db, realtime_db)
-				if err != nil {
-					out.Println("Problem Storing Results:", err)
+				if len(oid_data.Data) == 0 {
+					out.Println("Problem storing results: No data to store.")
+				} else {
+					if warehouse_db != nil || realtime_db != nil {
+						var data = generateInsertData(oid_data)
+						if warehouse_db != nil && oid_data.Config.History == "Yes" {
+							err = storeInWarehouseDb(data, warehouse_db)
+							if err != nil {
+								out.Println("Problem Storing Warehouse Results:", err)
+							}
+						}
+						if realtime_db != nil && oid_data.Config.RealTimeReporting == "Yes" {
+							err = storeInRealtimeDB(data, realtime_db)
+							if err != nil {
+								out.Println("Problem Storing Realtime Results:", err)
+							}
+						}
+					}
 				}
 				err = updateDbPollTimes(oid_data.Config, dbmap)
 				if err != nil {
