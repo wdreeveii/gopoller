@@ -15,7 +15,7 @@ type Config struct {
 		Main  string
 		Level string
 	}
-	Config struct {
+	Mediator struct {
 		Host     string
 		Port     uint
 		Database string
@@ -38,13 +38,6 @@ type Config struct {
 		Password string
 	}
 	Stats struct {
-		Host     string
-		Port     uint
-		Database string
-		Username string
-		Password string
-	}
-	Alarms struct {
 		Host     string
 		Port     uint
 		Database string
@@ -82,17 +75,17 @@ func validateConfig(cfg Config) (result Config, err error) {
 		err = errors.New("Logging: Log level not one of: " + strings.Join(Keys(valid_loglevels), ", "))
 	}
 
-	if len(cfg.Config.Host) == 0 {
+	if len(cfg.Mediator.Host) == 0 {
 		err = errors.New("Config: No host provided.")
-	} else if cfg.Config.Port == 0 {
+	} else if cfg.Mediator.Port == 0 {
 		err = errors.New("Config: No port provided.")
-	} else if len(cfg.Config.Database) == 0 {
+	} else if len(cfg.Mediator.Database) == 0 {
 		err = errors.New("Config: No database provided.")
-	} else if len(cfg.Config.Username) == 0 {
+	} else if len(cfg.Mediator.Username) == 0 {
 		err = errors.New("Config: No username provided.")
-	} else if len(cfg.Config.Password) == 0 {
+	} else if len(cfg.Mediator.Password) == 0 {
 		err = errors.New("Config: No password provided.")
-	} else if len(cfg.Config.Filter) == 0 {
+	} else if len(cfg.Mediator.Filter) == 0 {
 		err = errors.New("Config: No filter provided.")
 	}
 
@@ -120,17 +113,6 @@ func validateConfig(cfg Config) (result Config, err error) {
 		}
 	}
 
-	if len(cfg.Alarms.Host) == 0 {
-		err = errors.New("Alarms: No host provided.")
-	} else if cfg.Alarms.Port == 0 {
-		err = errors.New("Alarms: No port provided.")
-	} else if len(cfg.Alarms.Database) == 0 {
-		err = errors.New("Alarms: No database provided.")
-	} else if len(cfg.Alarms.Username) == 0 {
-		err = errors.New("Alarms: No username provided.")
-	} else if len(cfg.Alarms.Password) == 0 {
-		err = errors.New("Alarms: No password provided.")
-	}
 	return
 }
 

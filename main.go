@@ -63,11 +63,9 @@ func updatePollTimes(result SnmpFetchResult) (res SnmpFetchResult) {
 	today := time.Date(year, month, day, 0, 0, 0, 0, time.Local)
 	freq := time.Duration(res.Config.PollFreq) * time.Second
 
-	pollOffset := freq / 4
-
 	current_daily_timeslot := current.Sub(today) / freq
 	next_timeslot_start := today.Add((current_daily_timeslot + 1) * freq)
-	next_poll_start := next_timeslot_start.Add(pollOffset + time.Duration(rand.Int63n(int64(pollOffset))))
+	next_poll_start := next_timeslot_start.Add(time.Duration(rand.Int63n(int64(freq - (180 * time.Second) ))))
 
 	res.Config.LastPollTime = Now()
 	res.Config.NextPollTime = next_poll_start.UnixNano() / int64(time.Millisecond)
@@ -244,19 +242,19 @@ func pollConfig(cfg Config) {
 		}
 	}()
 
-	var config_dsn string
+	var mediator_dsn string
 	// build connection string
-	config_dsn = cfg.Config.Username + ":" + cfg.Config.Password +
-		"@tcp(" + cfg.Config.Host + ":" + strconv.Itoa(int(cfg.Config.Port)) + ")/" +
-		cfg.Config.Database + "?allowOldPasswords=1"
-	config_db, err := openAndPingDb(config_dsn)
+	mediator_dsn = cfg.Mediator.Username + ":" + cfg.Mediator.Password +
+		"@tcp(" + cfg.Mediator.Host + ":" + strconv.Itoa(int(cfg.Mediator.Port)) + ")/" +
+		cfg.Mediator.Database + "?allowOldPasswords=1"
+	mediator_db, err := openAndPingDb(mediator_dsn)
 	if err != nil {
 		stopConfirmation = <-cfg.stopChan
 		stopConfirmation <- true
 		return
 	}
 	// close db before this function returns
-	defer config_db.Close()
+	defer mediator_db.Close()
 
 	var warehouse_db *sql.DB
 	if cfg.WarehouseProvided() {
@@ -296,29 +294,17 @@ func pollConfig(cfg Config) {
 		}
 	}()
 
-	var alarms_dsn string
-	alarms_dsn = cfg.Alarms.Username + ":" + cfg.Alarms.Password +
-		"@tcp(" + cfg.Alarms.Host + ":" + strconv.Itoa(int(cfg.Alarms.Port)) + ")/" +
-		cfg.Alarms.Database + "?allowOldPasswords=1"
-	alarms_db, err := openAndPingDb(alarms_dsn)
-	if err != nil {
-		stopConfirmation = <-cfg.stopChan
-		stopConfirmation <- true
-		return
-	}
-	defer alarms_db.Close()
-
 	// NewTicker returns a new Ticker containing a channel that will send
 	// the time with a period specified by the duration argument.
 	rate_limiter := time.NewTicker(100 * time.Millisecond)
 	defer rate_limiter.Stop()
 
 	// setup sql to data structure mapping
-	dbmap := &gorp.DbMap{Db: config_db, Dialect: gorp.MySQLDialect{}}
+	dbmap := &gorp.DbMap{Db: mediator_db, Dialect: gorp.MySQLDialect{}}
 	dbmap.AddTableWithName(SnmpPollingConfig{}, "snmpPollingConfig")
 	// pull oids from the database
 	var configs []SnmpPollingConfig
-	_, err = dbmap.Select(&configs, "SELECT * FROM snmpPollingConfig WHERE "+cfg.Config.Filter[0])
+	_, err = dbmap.Select(&configs, "SELECT * FROM snmpPollingConfig WHERE "+cfg.Mediator.Filter[0])
 	if err != nil {
 		stopConfirmation = <-cfg.stopChan
 		stopConfirmation <- true
@@ -399,7 +385,7 @@ MAINLOOP:
 					if err != nil {
 						out.Println(err)
 					}
-					err = setAlarms(oid_data.Config.ResourceName, 5, alarms_db)
+					err = setAlarms(oid_data.Config.ResourceName, 5, mediator_db)
 					if err != nil {
 						out.Println(err)
 					}
@@ -433,7 +419,7 @@ MAINLOOP:
 				if err != nil {
 					out.Println("Problem Updating Poll Times:", err)
 				}
-				err = setAlarms(oid_data.Config.ResourceName, 0, alarms_db)
+				err = setAlarms(oid_data.Config.ResourceName, 0, mediator_db)
 				if err != nil {
 					out.Println("Problem Setting Alarms:", err)
 				}
