@@ -2,17 +2,18 @@ package main
 
 import (
 	"database/sql"
+	"errors"
+	"flag"
 	"fmt"
-	"github.com/alouca/gosnmp"
 	"github.com/coopernurse/gorp"
 	_ "github.com/go-sql-driver/mysql"
+	g "github.com/soniah/gosnmp"
 	"log"
 	"math/rand"
 	"os"
 	"os/signal"
 	"runtime/pprof"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 )
@@ -34,7 +35,7 @@ type SnmpPollingConfig struct {
 	SnmpV3PrivacyProtocol          string `db:"snmpV3PrivacyProtocol"`
 	SnmpV3PrivacyPassphrase        string `db:"snmpV3PrivacyPassphrase"`
 	SnmpV3SecurityName             string `db:"snmpV3SecurityName"`
-	SnmpTimeout                    int64  `db:"snmpTimeout"`
+	SnmpTimeout                    int    `db:"snmpTimeout"`
 	SnmpRetries                    int    `db:"snmpRetries"`
 	SnmpEnabled                    string `db:"snmpEnabled"`
 	Oid                            string `db:"oid"`
@@ -48,16 +49,15 @@ type SnmpPollingConfig struct {
 }
 
 type SnmpFetchResult struct {
-	Config  SnmpPollingConfig
-	Retries int
-	Data    []gosnmp.SnmpPDU
-	Err     error
+	Config SnmpPollingConfig
+	Data   []g.SnmpPDU
+	Err    error
 }
 
 // update poll time fields in the snmpPollingConfig structure
 func updatePollTimes(result SnmpFetchResult) (res SnmpFetchResult) {
 	res = result
-	// this time math is used to generate a poll time 1/4 of the way through the next timeslot
+	// this time math is used to generate a poll time between the start of the next timeslot and 2 minutes before the next timeslot ends.
 	current := time.Now()
 	year, month, day := current.Date()
 	today := time.Date(year, month, day, 0, 0, 0, 0, time.Local)
@@ -65,7 +65,8 @@ func updatePollTimes(result SnmpFetchResult) (res SnmpFetchResult) {
 
 	current_daily_timeslot := current.Sub(today) / freq
 	next_timeslot_start := today.Add((current_daily_timeslot + 1) * freq)
-	next_poll_start := next_timeslot_start.Add(time.Duration(rand.Int63n(int64(freq - (180 * time.Second) ))))
+
+	next_poll_start := next_timeslot_start.Add((time.Duration(rand.Intn(int(float64(res.Config.PollFreq)*0.8))) * time.Second) + (time.Duration(rand.Intn(1000)) * time.Millisecond))
 
 	res.Config.LastPollTime = Now()
 	res.Config.NextPollTime = next_poll_start.UnixNano() / int64(time.Millisecond)
@@ -84,14 +85,40 @@ func updateDbPollTimes(c SnmpPollingConfig, dbmap *gorp.DbMap) (err error) {
 
 // convert snmp value types into a string representation and
 // fixup differences in naming between gosnmp's and the original
-func stringifyType(t gosnmp.Asn1BER) string {
-	if t == gosnmp.Counter32 {
+func stringifyType(t g.Asn1BER) string {
+	switch t {
+	case g.Boolean:
+		return "BOOLEAN"
+	case g.Integer:
+		return "INTEGER"
+	case g.BitString:
+		return "BITSTRING"
+	case g.OctetString:
+		return "OCTETSTRING"
+	case g.Null:
+		return "NULL"
+	case g.ObjectIdentifier:
+		return "OBJECTIDENTIFIER"
+	case g.ObjectDescription:
+		return "OBJECTDESCRIPTION"
+	case g.IPAddress:
+		return "IPADDRESS"
+	case g.Counter32:
 		return "COUNTER"
-	} else if t == gosnmp.Gauge32 {
+	case g.Gauge32:
 		return "GAUGE"
-	} else {
-		return strings.ToUpper(t.String())
+	case g.TimeTicks:
+		return "TIMETICKS"
+	case g.Opaque:
+		return "OPAQUE"
+	case g.NsapAddress:
+		return "NSAPADDRESS"
+	case g.Counter64:
+		return "COUNTER"
+	case g.Uinteger32:
+		return "UINTEGER"
 	}
+	return "UNKOWN ASN1BER"
 }
 
 // generate a bulk insert statement to insert the values
@@ -141,43 +168,91 @@ func setAlarms(resourceName string, severity int, db *sql.DB) error {
 }
 
 // do one snmp query
-func fetchOidFromConfig(cfg SnmpPollingConfig, retries int, done chan SnmpFetchResult) {
-	var result = SnmpFetchResult{Config: cfg, Retries: retries}
+func fetchOidFromConfig(cfg SnmpPollingConfig, done chan SnmpFetchResult) {
+	var result = SnmpFetchResult{Config: cfg}
 
 	//time.Sleep(time.Duration(idx * 100000000))
-	var snmpver gosnmp.SnmpVersion
+	var snmpver g.SnmpVersion
+	var msgflags g.SnmpV3MsgFlags
+	var securityParams g.UsmSecurityParameters
 	if cfg.SnmpVersion == "SNMP2c" {
-		snmpver = gosnmp.Version2c
+		snmpver = g.Version2c
 	} else if cfg.SnmpVersion == "SNMP1" {
-		snmpver = gosnmp.Version1
+		snmpver = g.Version1
+	} else if cfg.SnmpVersion == "SNMP3" {
+		snmpver = g.Version3
+
+		if cfg.SnmpV3SecurityLevel == "authPriv" {
+			msgflags = g.AuthPriv
+		} else if cfg.SnmpV3SecurityLevel == "authNoPriv" {
+			msgflags = g.AuthNoPriv
+		} else {
+			msgflags = g.NoAuthNoPriv
+		}
+		msgflags |= g.Reportable
+
+		var authProtocol g.SnmpV3AuthProtocol
+		if cfg.SnmpV3AuthenticationProtocol == "SHA" {
+			authProtocol = g.SHA
+		} else {
+			authProtocol = g.MD5
+		}
+
+		var privProtocol g.SnmpV3PrivProtocol
+		if cfg.SnmpV3PrivacyProtocol == "AES" {
+			privProtocol = g.AES
+		} else {
+			privProtocol = g.DES
+		}
+
+		securityParams = g.UsmSecurityParameters{UserName: cfg.SnmpV3SecurityName,
+			AuthenticationProtocol:   authProtocol,
+			AuthenticationPassphrase: cfg.SnmpV3AuthenticationPassphrase,
+			PrivacyProtocol:          privProtocol,
+			PrivacyPassphrase:        cfg.SnmpV3PrivacyPassphrase,
+		}
 	}
-	//cfg.SnmpTimeout = 60
-	var SnmpConn *gosnmp.GoSNMP
-	SnmpConn, result.Err = gosnmp.NewGoSNMP(cfg.IpAddress, cfg.SnmpCommunityName, snmpver, cfg.SnmpTimeout)
+	conn := &g.GoSNMP{
+		Target:             cfg.IpAddress,
+		Port:               161,
+		Community:          cfg.SnmpCommunityName,
+		Version:            snmpver,
+		MsgFlags:           msgflags,
+		SecurityModel:      g.UserSecurityModel,
+		SecurityParameters: &securityParams,
+		Timeout:            time.Duration(cfg.SnmpTimeout*cfg.SnmpRetries) * time.Second,
+		Retries:            cfg.SnmpRetries,
+		MaxRepetitions:     10,
+	}
+
+	result.Err = conn.Connect()
 	if result.Err != nil {
 		done <- result
 		return
 	}
-	//SnmpConn.SetDebug(true)
-	//SnmpConn.SetVerbose(true)
-	SnmpConn.SetTimeout(cfg.SnmpTimeout)
-	var data []gosnmp.SnmpPDU
-	if cfg.PollType == "Walk" {
-		var res []gosnmp.SnmpPDU
-		res, result.Err = SnmpConn.BulkWalk(20, "."+cfg.Oid)
+	defer conn.Conn.Close()
+
+	var data []g.SnmpPDU
+	if cfg.PollType == "Walk" || cfg.PollType == "Table" {
+		var res []g.SnmpPDU
+		if conn.Version == g.Version1 {
+			res, result.Err = conn.WalkAll(cfg.Oid)
+		} else {
+			res, result.Err = conn.BulkWalkAll(cfg.Oid)
+		}
 		if result.Err != nil {
 			done <- result
 			return
 		}
-		data = append(data, res...)
+		data = res
 	} else if cfg.PollType == "Get" {
-		var resp *gosnmp.SnmpPacket
-		resp, result.Err = SnmpConn.Get(cfg.Oid)
+		var resp *g.SnmpPacket
+		resp, result.Err = conn.Get([]string{cfg.Oid})
 		if result.Err != nil {
 			done <- result
 			return
 		}
-		data = append(data, resp.Variables...)
+		data = resp.Variables
 	}
 	result = updatePollTimes(result)
 	result.Data = data
@@ -296,7 +371,7 @@ func pollConfig(cfg Config) {
 
 	// NewTicker returns a new Ticker containing a channel that will send
 	// the time with a period specified by the duration argument.
-	rate_limiter := time.NewTicker(100 * time.Millisecond)
+	rate_limiter := time.NewTicker(500 * time.Millisecond)
 	defer rate_limiter.Stop()
 
 	// setup sql to data structure mapping
@@ -323,7 +398,7 @@ func pollConfig(cfg Config) {
 			<-rate_limiter.C
 			num_fetching++
 			Debugln(out, cfg, "fetching:", num_fetching, c)
-			go fetchOidFromConfig(c, 0, result)
+			go fetchOidFromConfig(c, result)
 		} else {
 			// this oid is not ready to be pulled
 			// create a go routine that is paused until the oid is ready
@@ -355,7 +430,7 @@ MAINLOOP:
 			<-rate_limiter.C
 			num_fetching++
 			Debugln(out, cfg, "fetching:", num_fetching, snmp_cfg.ResourceName, snmp_cfg.IpAddress, snmp_cfg.Oid, snmp_cfg.PollType, snmp_cfg.PollFreq)
-			go fetchOidFromConfig(snmp_cfg, 0, result)
+			go fetchOidFromConfig(snmp_cfg, result)
 		case oid_data := <-result:
 			// recieved the results of a snmp query
 			num_fetching--
@@ -363,28 +438,19 @@ MAINLOOP:
 				// there was an error with this fetch so keep a count
 				num_errors++
 				out.Println(oid_data.Err)
-				if oid_data.Retries < oid_data.Config.SnmpRetries {
-					// begin a new request if the oid has not
-					// been fetched too many times
-					if waiting_oids != nil {
-						<-rate_limiter.C
-						num_fetching++
-						Debugln(out, cfg, "fetching:", num_fetching, oid_data.Config.ResourceName, oid_data.Config.IpAddress, oid_data.Config.Oid, oid_data.Config.PollType, oid_data.Config.PollFreq)
-						go fetchOidFromConfig(oid_data.Config, oid_data.Retries+1, result)
-					}
-				} else {
-					// this oid has been tried too many times this cycle,
-					// requeue for the next cycle
-					num_total_timeout++
-					oid_data = updatePollTimes(oid_data)
-					if waiting_oids != nil {
-						go Delay(oid_data.Config, waiting_oids)
-					}
-					// update poll times in snmpPollingConfig
-					err = updateDbPollTimes(oid_data.Config, dbmap)
-					if err != nil {
-						out.Println(err)
-					}
+				// this oid has been tried too many times this cycle,
+				// requeue for the next cycle
+				num_total_timeout++
+				oid_data = updatePollTimes(oid_data)
+				if waiting_oids != nil {
+					go Delay(oid_data.Config, waiting_oids)
+				}
+				// update poll times in snmpPollingConfig
+				err = updateDbPollTimes(oid_data.Config, dbmap)
+				if err != nil {
+					out.Println(err)
+				}
+				if !alarmsDisabled {
 					err = setAlarms(oid_data.Config.ResourceName, 5, mediator_db)
 					if err != nil {
 						out.Println(err)
@@ -419,9 +485,11 @@ MAINLOOP:
 				if err != nil {
 					out.Println("Problem Updating Poll Times:", err)
 				}
-				err = setAlarms(oid_data.Config.ResourceName, 0, mediator_db)
-				if err != nil {
-					out.Println("Problem Setting Alarms:", err)
+				if !alarmsDisabled {
+					err = setAlarms(oid_data.Config.ResourceName, 0, mediator_db)
+					if err != nil {
+						out.Println("Problem Setting Alarms:", err)
+					}
 				}
 				Debugln(out, cfg, "Received:", num_fetching, ":", len(oid_data.Data), "variables. Requested:", oid_data.Config.Oid)
 			}
@@ -432,8 +500,23 @@ MAINLOOP:
 	stopConfirmation <- true
 }
 
+var configPath string
+var profileEnabled bool
+var alarmsDisabled bool
+
+func init() {
+	// config directory
+	flag.StringVar(&configPath, "config", "", "--config=/opt/config/dir")
+	flag.StringVar(&configPath, "c", "", "-c=/opt/config/dir")
+
+	// profile
+	flag.BoolVar(&profileEnabled, "profile", false, "--profile")
+	// report alarms
+	flag.BoolVar(&alarmsDisabled, "disable-alarms", false, "--disable-alarms")
+}
+
 func main() {
-	rand.Seed(Now())
+	rand.Seed(time.Now().UnixNano())
 	var err error
 	var out = log.New(os.Stdout, " ", log.Ldate|log.Ltime)
 
@@ -443,15 +526,35 @@ func main() {
 		}
 	}()
 
-	// parse args and get path
-	path, err := parseArgsAndFindPath()
+	flag.Parse()
+	exists, err := file_exists(configPath)
 	if err != nil {
 		return
 	}
+	if !exists {
+		print_instructions()
+		err = errors.New("config: File/Directory not found.")
+		return
+	}
+
+	if profileEnabled {
+		f, err := os.Create("poller.profile")
+		if err != nil {
+			return
+		}
+		pprof.StopCPUProfile()
+		pprof.StartCPUProfile(f)
+	}
+
 	// noop if profiling is not enabled
 	defer pprof.StopCPUProfile()
 
-	out.Println("Using Config:", path)
+	out.Println("Using Config:", configPath)
+	if alarmsDisabled {
+		out.Println("Alarms Disabled")
+	} else {
+		out.Println("Alarms Enabled")
+	}
 	// SIGHUP is the standard way to reinitialize configuration on command
 	signal_source := make(chan os.Signal)
 	signal.Notify(signal_source, syscall.SIGHUP)
@@ -459,7 +562,7 @@ func main() {
 		// read all configs at the specified path
 		// if path is a directory, read all files ending in .gcfg
 		// otherwise read path
-		cfgs, err := GetConfigs(path)
+		cfgs, err := GetConfigs(configPath)
 		if err != nil {
 			return
 		}
