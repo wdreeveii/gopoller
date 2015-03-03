@@ -373,7 +373,7 @@ func main() {
 	} else {
 		out.Println("Alarms Enabled")
 	}
-	out.Println("MaxReptitions:", reptitions)
+	out.Println("MaxReptitions:", repetitions)
 	// SIGHUP is the standard way to reinitialize configuration on command
 	signalSource := make(chan os.Signal)
 	signal.Notify(signalSource, syscall.SIGHUP)
