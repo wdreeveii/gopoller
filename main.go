@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"runtime"
 	"runtime/pprof"
 	"strconv"
 	"syscall"
@@ -123,37 +125,48 @@ func stringifyType(t g.Asn1BER) string {
 
 // generate a bulk insert statement to insert the values
 // into the database
-func generateInsertData(res SnmpFetchResult) *string {
-	var data string
+func generateInsertData(res SnmpFetchResult) string {
+	var data = make([]byte, 0, 50*len(res.Data))
 
 	for i, v := range res.Data {
 		if i != 0 {
-			data += ", "
+			data = append(data, ", "...)
 		}
-		data += "(" +
-			fmt.Sprint(res.Config.LastPollTime/1000) + "," +
-			"'" + res.Config.IpAddress + "'," +
-			"'" + v.Name[1:] + "'," +
-			"'" + stringifyType(v.Type) + "'," +
-			"'" + fmt.Sprint(v.Value) + "' " +
-			")"
+		// convert byte arrays to hex encoded strings
+		var value interface{}
+		if nval, ok := v.Value.([]byte); ok {
+			value = hex.EncodeToString(nval)
+		} else {
+			value = v.Value
+		}
+		data = append(data, "("...)
+		data = append(data, fmt.Sprint(res.Config.LastPollTime/1000)...)
+		data = append(data, ",'"...)
+		data = append(data, res.Config.IpAddress...)
+		data = append(data, "','"...)
+		data = append(data, v.Name[1:]...)
+		data = append(data, "','"...)
+		data = append(data, stringifyType(v.Type)...)
+		data = append(data, "','"...)
+		data = append(data, fmt.Sprint(value)...)
+		data = append(data, "')"...)
 	}
-	return &data
+	return string(data)
 }
 
-func storeInWarehouseDb(data *string, warehouse_db *sql.DB) (err error) {
+func storeInWarehouseDb(data string, warehouse_db *sql.DB) (err error) {
 	var q = "" +
 		"INSERT INTO raw_data_" + time.Now().Format("02") +
 		" (`dtMetric`, `host`, `oid`, `typeOid`, `value`) VALUES "
-	q += *data
+	q += data
 	_, err = warehouse_db.Exec(q)
 	return err
 }
 
-func storeInRealtimeDB(data *string, realtime_db *sql.DB) (err error) {
+func storeInRealtimeDB(data string, realtime_db *sql.DB) (err error) {
 	var q = "" +
 		"INSERT INTO rawData (`tsMetric`, `hostIpAddress`, `oid`, `typeOid`, `value`) VALUES "
-	q += *data
+	q += data
 	_, err = realtime_db.Exec(q)
 	return err
 }
@@ -222,7 +235,7 @@ func fetchOidFromConfig(cfg SnmpPollingConfig, done chan SnmpFetchResult) {
 		SecurityParameters: &securityParams,
 		Timeout:            time.Duration(cfg.SnmpTimeout*cfg.SnmpRetries) * time.Second,
 		Retries:            cfg.SnmpRetries,
-		MaxRepetitions:     10,
+		MaxRepetitions:     repetitions,
 	}
 
 	result.Err = conn.Connect()
@@ -296,8 +309,154 @@ func openAndPingDb(dsn string) (db *sql.DB, err error) {
 	return
 }
 
-// main polling function for 1 configuration file
-func pollConfig(cfg Config) {
+var configPath string
+var profileEnabled bool
+var alarmsDisabled bool
+var cores int
+var repetitions int
+
+func init() {
+	// config directory
+	flag.StringVar(&configPath, "config", "", "--config=/opt/config/dir")
+	flag.StringVar(&configPath, "c", "", "-c=/opt/config/dir")
+
+	// profile
+	flag.BoolVar(&profileEnabled, "profile", false, "--profile")
+	// report alarms
+	flag.BoolVar(&alarmsDisabled, "disable-alarms", false, "--disable-alarms")
+
+	// number of cpu cores to use
+	flag.IntVar(&cores, "cores", 1, "--cores=2")
+	// value of max repetitions default: 10
+	flag.IntVar(&repetitions, "reps", 10, "--reps=10 higher for fast networks")
+}
+
+func main() {
+	runtime.GOMAXPROCS(cores)
+
+	rand.Seed(time.Now().UnixNano())
+	var err error
+	var out = log.New(os.Stdout, " ", log.Ldate|log.Ltime)
+
+	defer func() {
+		if err != nil {
+			out.Println(err)
+		}
+	}()
+
+	flag.Parse()
+	exists, err := fileExists(configPath)
+	if err != nil {
+		return
+	}
+	if !exists {
+		printInstructions(out)
+		err = errors.New("config: File/Directory not found.")
+		return
+	}
+
+	if profileEnabled {
+		f, err := os.Create("poller.profile")
+		if err != nil {
+			return
+		}
+		pprof.StopCPUProfile()
+		pprof.StartCPUProfile(f)
+	}
+
+	// noop if profiling is not enabled
+	defer pprof.StopCPUProfile()
+
+	out.Println("Using Config:", configPath)
+	if alarmsDisabled {
+		out.Println("Alarms Disabled")
+	} else {
+		out.Println("Alarms Enabled")
+	}
+	out.Println("MaxReptitions:", reptitions)
+	// SIGHUP is the standard way to reinitialize configuration on command
+	signalSource := make(chan os.Signal)
+	signal.Notify(signalSource, syscall.SIGHUP)
+	for {
+		var cfg Config
+		// read the base config file that will be used to generate configs for each host
+		cfg, err = getPollerConfig(configPath)
+		if err != nil {
+			return
+		}
+		// get the snmpPollingConfigs sorted by resourceName
+		var snmpCmds map[string][]SnmpPollingConfig
+		snmpCmds, err = getSnmpConfigs(cfg)
+		if err != nil {
+			return
+		}
+		// create channels to notify config managers when they need to stop and clean up
+		var cfgs []Config
+		for k, v := range snmpCmds {
+			var snmpConfigList = v
+			var cfgCopy = cfg
+			cfgCopy.stopChan = make(chan chan bool)
+			cfgCopy.Logging.Main += "/" + k + ".log"
+
+			go pollConfig(cfgCopy, snmpConfigList)
+
+			cfgs = append(cfgs, cfgCopy)
+		}
+		// periodically restart the system so config is reinitialized from file
+		restart := time.After(10 * time.Minute)
+		select {
+		case sig := <-signalSource:
+			// recieved a SIGHUP
+			out.Println("Recieved signal:", sig)
+		case <-restart:
+			// initiating periodic restart
+			out.Println("Restarting")
+		}
+		// a channel is sent to each config manager so that it can in turn
+		// notify us when they are finished cleaning up
+		var stop_replies []chan bool
+		for _, v := range cfgs {
+			reply_chan := make(chan bool)
+			stop_replies = append(stop_replies, reply_chan)
+			v.stopChan <- reply_chan
+		}
+		out.Println("Waiting for threads to end.")
+		// wait for all managers to exit
+		for _, v := range stop_replies {
+			<-v
+		}
+		out.Println("All cleaned up.")
+	}
+}
+func getSnmpConfigs(cfg Config) (configMap map[string][]SnmpPollingConfig, err error) {
+	var mediator_dsn string
+	// build connection string
+	mediator_dsn = cfg.Mediator.Username + ":" + cfg.Mediator.Password +
+		"@tcp(" + cfg.Mediator.Host + ":" + strconv.Itoa(int(cfg.Mediator.Port)) + ")/" +
+		cfg.Mediator.Database + "?allowOldPasswords=1"
+	mediator_db, err := openAndPingDb(mediator_dsn)
+	if err != nil {
+		return
+	}
+	defer mediator_db.Close()
+
+	// setup sql to data structure mapping
+	dbmap := &gorp.DbMap{Db: mediator_db, Dialect: gorp.MySQLDialect{}}
+	// pull oids from the database
+	var configs []SnmpPollingConfig
+	_, err = dbmap.Select(&configs, "SELECT * FROM snmpPollingConfig WHERE "+cfg.Mediator.Where)
+	if err != nil {
+		return
+	}
+	configMap = make(map[string][]SnmpPollingConfig)
+	for _, v := range configs {
+		configMap[v.ResourceName] = append(configMap[v.ResourceName], v)
+	}
+	return
+}
+
+// main polling function for 1 host
+func pollConfig(cfg Config, configs []SnmpPollingConfig) {
 	var err error
 	var stopConfirmation chan bool
 	logfile, err := os.OpenFile(cfg.Logging.Main, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0660)
@@ -376,15 +535,7 @@ func pollConfig(cfg Config) {
 
 	// setup sql to data structure mapping
 	dbmap := &gorp.DbMap{Db: mediator_db, Dialect: gorp.MySQLDialect{}}
-	dbmap.AddTableWithName(SnmpPollingConfig{}, "snmpPollingConfig")
-	// pull oids from the database
-	var configs []SnmpPollingConfig
-	_, err = dbmap.Select(&configs, "SELECT * FROM snmpPollingConfig WHERE "+cfg.Mediator.Filter[0])
-	if err != nil {
-		stopConfirmation = <-cfg.stopChan
-		stopConfirmation <- true
-		return
-	}
+
 	// waiting_oids is used to notify the main loop when oids are ready to pull
 	var waiting_oids = make(chan SnmpPollingConfig, len(configs))
 	// results of the snmp query
@@ -432,12 +583,12 @@ MAINLOOP:
 			Debugln(out, cfg, "fetching:", num_fetching, snmp_cfg.ResourceName, snmp_cfg.IpAddress, snmp_cfg.Oid, snmp_cfg.PollType, snmp_cfg.PollFreq)
 			go fetchOidFromConfig(snmp_cfg, result)
 		case oid_data := <-result:
-			// recieved the results of a snmp query
+			// received the results of a snmp query
 			num_fetching--
 			if oid_data.Err != nil {
 				// there was an error with this fetch so keep a count
 				num_errors++
-				out.Println(oid_data.Err)
+				Debugln(out, cfg, oid_data.Config.ResourceName, oid_data.Config.IpAddress, oid_data.Config.Oid, oid_data.Err)
 				// this oid has been tried too many times this cycle,
 				// requeue for the next cycle
 				num_total_timeout++
@@ -467,6 +618,7 @@ MAINLOOP:
 				} else {
 					if warehouse_db != nil || realtime_db != nil {
 						var data = generateInsertData(oid_data)
+						Debugln(out, cfg, "Finished marshalling data")
 						if warehouse_db != nil && oid_data.Config.History == "Yes" {
 							err = storeInWarehouseDb(data, warehouse_db)
 							if err != nil {
@@ -498,103 +650,4 @@ MAINLOOP:
 	}
 	Debugln(out, cfg, "Config Manage All Done.")
 	stopConfirmation <- true
-}
-
-var configPath string
-var profileEnabled bool
-var alarmsDisabled bool
-
-func init() {
-	// config directory
-	flag.StringVar(&configPath, "config", "", "--config=/opt/config/dir")
-	flag.StringVar(&configPath, "c", "", "-c=/opt/config/dir")
-
-	// profile
-	flag.BoolVar(&profileEnabled, "profile", false, "--profile")
-	// report alarms
-	flag.BoolVar(&alarmsDisabled, "disable-alarms", false, "--disable-alarms")
-}
-
-func main() {
-	rand.Seed(time.Now().UnixNano())
-	var err error
-	var out = log.New(os.Stdout, " ", log.Ldate|log.Ltime)
-
-	defer func() {
-		if err != nil {
-			out.Println(err)
-		}
-	}()
-
-	flag.Parse()
-	exists, err := file_exists(configPath)
-	if err != nil {
-		return
-	}
-	if !exists {
-		print_instructions()
-		err = errors.New("config: File/Directory not found.")
-		return
-	}
-
-	if profileEnabled {
-		f, err := os.Create("poller.profile")
-		if err != nil {
-			return
-		}
-		pprof.StopCPUProfile()
-		pprof.StartCPUProfile(f)
-	}
-
-	// noop if profiling is not enabled
-	defer pprof.StopCPUProfile()
-
-	out.Println("Using Config:", configPath)
-	if alarmsDisabled {
-		out.Println("Alarms Disabled")
-	} else {
-		out.Println("Alarms Enabled")
-	}
-	// SIGHUP is the standard way to reinitialize configuration on command
-	signal_source := make(chan os.Signal)
-	signal.Notify(signal_source, syscall.SIGHUP)
-	for {
-		// read all configs at the specified path
-		// if path is a directory, read all files ending in .gcfg
-		// otherwise read path
-		cfgs, err := GetConfigs(configPath)
-		if err != nil {
-			return
-		}
-		out.Println(len(cfgs), "valid configs.")
-		// create channels to notify config managers when they need to stop and clean up
-		for i, _ := range cfgs {
-			cfgs[i].stopChan = make(chan chan bool)
-			go pollConfig(cfgs[i])
-		}
-		// periodically restart the system so config is reinitialized from file
-		restart := time.After(10 * time.Minute)
-		select {
-		case sig := <-signal_source:
-			// recieved a SIGHUP
-			out.Println("Recieved signal:", sig)
-		case <-restart:
-			// initiating periodic restart
-			out.Println("Restarting")
-		}
-		// a channel is sent to each config manager so that it can in turn
-		// notify us when they are finished cleaning up
-		var stop_replies []chan bool
-		for _, v := range cfgs {
-			reply_chan := make(chan bool)
-			stop_replies = append(stop_replies, reply_chan)
-			v.stopChan <- reply_chan
-		}
-		out.Println("Waiting for threads to end.")
-		// wait for all managers to exit
-		for _, v := range stop_replies {
-			<-v
-		}
-		out.Println("All cleaned up.")
-	}
 }

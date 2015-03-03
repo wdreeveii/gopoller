@@ -1,23 +1,25 @@
 package main
 
 import (
-	"fmt"
+	"log"
 	"os"
 )
 
-func print_instructions() {
+func printInstructions(out *log.Logger) {
 	var instructions = `
 gopoller Copyright GCI
 Options:
-	--config=/opt/config/dir
-	-c=/opt/config/dir
+	--config=/etc/gopoller.gcfg
+	-c=/etc/gopoller.gcfg
 	--disable-alarms
+	--cores=<number of cpus>
+	--reps=10 - 50 or 100 for fast networks
 `
-	fmt.Print(instructions)
+	out.Print(instructions)
 }
 
 // exists returns whether the given file or directory exists or not
-func file_exists(path string) (bool, error) {
+func fileExists(path string) (bool, error) {
 	_, err := os.Stat(path)
 	if err == nil {
 		return true, nil
@@ -26,4 +28,15 @@ func file_exists(path string) (bool, error) {
 		return false, nil
 	}
 	return false, err
+}
+
+func fileIsDir(path string) (bool, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+	if fi.IsDir() {
+		return true, nil
+	}
+	return false, nil
 }

@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"code.google.com/p/gcfg"
 	"errors"
-	"fmt"
 	"os"
 	"strings"
 )
@@ -21,7 +20,7 @@ type Config struct {
 		Database string
 		Username string
 		Password string
-		Filter   []string
+		Where    string
 	}
 	Warehouse struct {
 		Host     string
@@ -69,54 +68,83 @@ func validateConfig(cfg Config) (result Config, err error) {
 
 	if len(cfg.Logging.Main) == 0 {
 		err = errors.New("Logging: Main logging destination not provided.")
-	} else if len(cfg.Logging.Level) == 0 {
+		return
+	} else {
+		var isDir bool
+		isDir, err = fileIsDir(cfg.Logging.Main)
+		if err != nil {
+			return
+		}
+		if !isDir {
+			err = errors.New("Logging: Main must be a directory.")
+			return
+		}
+	}
+
+	if len(cfg.Logging.Level) == 0 {
 		err = errors.New("Logging: Log level not provided.")
+		return
 	} else if !valid_loglevels[cfg.Logging.Level] {
 		err = errors.New("Logging: Log level not one of: " + strings.Join(Keys(valid_loglevels), ", "))
+		return
 	}
 
 	if len(cfg.Mediator.Host) == 0 {
 		err = errors.New("Config: No host provided.")
+		return
 	} else if cfg.Mediator.Port == 0 {
 		err = errors.New("Config: No port provided.")
+		return
 	} else if len(cfg.Mediator.Database) == 0 {
 		err = errors.New("Config: No database provided.")
+		return
 	} else if len(cfg.Mediator.Username) == 0 {
 		err = errors.New("Config: No username provided.")
+		return
 	} else if len(cfg.Mediator.Password) == 0 {
 		err = errors.New("Config: No password provided.")
-	} else if len(cfg.Mediator.Filter) == 0 {
+		return
+	} else if len(cfg.Mediator.Where) == 0 {
 		err = errors.New("Config: No filter provided.")
+		return
 	}
 
 	if cfg.WarehouseProvided() {
 		if cfg.Warehouse.Port == 0 {
 			err = errors.New("Warehouse: No port provided.")
+			return
 		} else if len(cfg.Warehouse.Database) == 0 {
 			err = errors.New("Warehouse: No database provided.")
+			return
 		} else if len(cfg.Warehouse.Username) == 0 {
 			err = errors.New("Warehouse: No username provided.")
+			return
 		} else if len(cfg.Warehouse.Password) == 0 {
 			err = errors.New("Warehouse: No password provided.")
+			return
 		}
 	}
 
 	if cfg.RealtimeProvided() {
 		if cfg.Realtime.Port == 0 {
 			err = errors.New("Realtime: No port provided.")
+			return
 		} else if len(cfg.Realtime.Database) == 0 {
 			err = errors.New("Realtime: No database provided.")
+			return
 		} else if len(cfg.Realtime.Username) == 0 {
 			err = errors.New("Realtime: No username provided.")
+			return
 		} else if len(cfg.Realtime.Password) == 0 {
 			err = errors.New("Realtime: No password provided.")
+			return
 		}
 	}
 
 	return
 }
 
-func GetConfigs(path string) (cfgs []Config, err error) {
+func getPollerConfig(path string) (cfg Config, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return
@@ -126,41 +154,15 @@ func GetConfigs(path string) (cfgs []Config, err error) {
 	if err != nil {
 		return
 	}
-	if info.IsDir() {
-		dir_info, err := f.Readdirnames(0)
-		if err != nil {
-			return cfgs, err
-		}
-		for _, v := range dir_info {
-			if strings.HasSuffix(v, ".gcfg") {
-				var one_cfg Config
-				err := gcfg.ReadFileInto(&one_cfg, path+"/"+v)
-				if err != nil {
-					fmt.Println(err)
-				} else {
-					one_cfg, err = validateConfig(one_cfg)
-					if err != nil {
-						fmt.Println(v, ":", err)
-					} else {
-						cfgs = append(cfgs, one_cfg)
-					}
-				}
-			}
-		}
-	} else {
+	if !info.IsDir() {
 		file_reader := bufio.NewReader(f)
-		var one_cfg Config
-		err := gcfg.ReadInto(&one_cfg, file_reader)
+		err = gcfg.ReadInto(&cfg, file_reader)
 		if err != nil {
-			return cfgs, err
-		} else {
-			one_cfg, err = validateConfig(one_cfg)
-			if err != nil {
-				fmt.Println(path, ":", err)
-			} else {
-				cfgs = append(cfgs, one_cfg)
-			}
+			return
 		}
+		cfg, err = validateConfig(cfg)
+	} else {
+		err = errors.New(path + " is not a file.")
 	}
 	return
 }
